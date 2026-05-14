@@ -12,8 +12,7 @@ This Proof of Concept (POC) is a real-time local C# application that listens to 
    ```
 
 ## First-Launch Expectations
-- **Model Downloads:** The application requires OpenVINO Parakeet for audio transcription (ASR) and the `all-MiniLM-L6-v2` ONNX model for text embeddings. On the very first launch, the app will automatically download these to the local `models/` directory.
-- **Proxy Configuration:** If you are operating behind a corporate proxy, you **must** configure your environment variables `HTTP_PROXY` and `HTTPS_PROXY` (e.g., `http://proxy-iind.intel.com:911`) prior to running the app, or the model downloads will time out.
+- **Model Downloads:** The application requires OpenVINO Parakeet for audio transcription (ASR) and the `all-MiniLM-L6-v2` ONNX model for text embeddings. On the very first launch, the app will automatically download these to the local `models/` directory. System proxy settings are detected and applied automatically.
 - **Cold Start:** Expect the very first startup to take roughly 10-15 seconds as it compiles the OpenVINO caches (`CACHE_DIR`).
 
 ## Implementation Flow & Logic (Phases 1-3)
