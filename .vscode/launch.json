@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "PptPoc.App (No Build)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "none",
+      "program": "${workspaceFolder}/src/PptPoc.App/bin/Debug/net10.0-windows/PptPoc.App.dll",
+      "cwd": "${workspaceFolder}/src/PptPoc.App/bin/Debug/net10.0-windows"
+    }
+  ]
+}

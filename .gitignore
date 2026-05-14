@@ -1,0 +1,13 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+*.suo
+*.user
+
+# Data and Models
+models/
+logs/
+
+# Optional: macOS/Windows specific
+.DS_Store
+Thumbs.db
