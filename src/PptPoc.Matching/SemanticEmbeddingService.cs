@@ -28,6 +28,7 @@ public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
 
     public async Task InitializeAsync(string modelDir)
     {
+        modelDir = Path.GetFullPath(modelDir);
         Directory.CreateDirectory(modelDir);
         var modelPath = Path.Combine(modelDir, ModelFile);
         var vocabPath = Path.Combine(modelDir, "vocab.txt");
@@ -37,6 +38,11 @@ public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
         
         // Verify or download tokenizer vocab
         await DownloadFileIfMissingAsync(VocabUrl, vocabPath);
+
+        if (!File.Exists(modelPath) || !File.Exists(vocabPath))
+        {
+            throw new FileNotFoundException($"Model or vocab not found in {modelDir}. Download might have failed.");
+        }
 
         // Load Tokenizer using BertTokenizer
         _tokenizer = BertTokenizer.Create(vocabPath, new BertOptions { LowerCaseBeforeTokenization = true });
@@ -73,13 +79,27 @@ public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
         }
 
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-        
-        response.EnsureSuccessStatusCode();
+        try
+        {
+            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
 
-        using var fs = File.Create(destPath);
-        await response.Content.CopyToAsync(fs);
-        Log.Information($"Successfully downloaded {Path.GetFileName(destPath)}.");
+            using var fs = File.Create(destPath);
+            await response.Content.CopyToAsync(fs);
+            Log.Information($"Successfully downloaded {Path.GetFileName(destPath)}.");
+        }
+        catch (HttpRequestException ex)
+        {
+            Log.Error(ex, $"Network or proxy error while downloading {Path.GetFileName(destPath)} from {url}");
+            if (File.Exists(destPath)) File.Delete(destPath);
+            throw new InvalidOperationException($"Failed to download {Path.GetFileName(destPath)}. Check your network or proxy settings.", ex);
+        }
+        catch (TaskCanceledException ex)
+        {
+            Log.Error(ex, $"Download timed out for {Path.GetFileName(destPath)}");
+            if (File.Exists(destPath)) File.Delete(destPath);
+            throw new InvalidOperationException($"Download timed out for {Path.GetFileName(destPath)}.", ex);
+        }
     }
 
     public float[] GenerateEmbedding(string text)

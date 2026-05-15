@@ -105,15 +105,13 @@ public sealed class ParakeetAsrService : IAsrService
         ThrowIfDisposed();
 
         var root = string.IsNullOrWhiteSpace(modelPath) ? "models" : modelPath;
-        var modelDir = Path.Combine(root, "parakeet");
+        var modelDir = Path.GetFullPath(Path.Combine(root, "parakeet"));
         Directory.CreateDirectory(modelDir);
 
         Log.Information("Initializing Parakeet ASR. ModelDir={ModelDir}, Device={Device}", modelDir, openVinoDevice);
 
         var filesToDownload = GetInvalidOrMissingFiles(modelDir, forceDownload: false);
         await DownloadModelFilesAsync(modelDir, filesToDownload);
-        
-        EnsureOpenVinoRuntimePath();
 
         var deviceName = string.IsNullOrWhiteSpace(openVinoDevice) ? "AUTO" : openVinoDevice.ToUpperInvariant();
         try
@@ -691,11 +689,23 @@ public sealed class ParakeetAsrService : IAsrService
 
                 Log.Information("Finished downloading {File}", file);
             }
+            catch (HttpRequestException ex)
+            {
+                Log.Error(ex, "Network or proxy error downloading {File}", file);
+                DownloadProgressChanged?.Invoke(0, $"Network/Proxy Error downloading {file}");
+                throw new InvalidOperationException($"Network or proxy error while trying to download {file}. Check your proxy settings.", ex);
+            }
+            catch (TaskCanceledException ex)
+            {
+                Log.Error(ex, "Timeout downloading {File}", file);
+                DownloadProgressChanged?.Invoke(0, $"Timeout downloading {file}");
+                throw new InvalidOperationException($"Download timed out for {file}.", ex);
+            }
             catch (Exception ex)
             {
                 Log.Error(ex, "Failed to download Parakeet asset {File}", file);
                 DownloadProgressChanged?.Invoke(0, $"Error: {ex.Message}");
-                throw; // Re-throw to be caught by the InitializeAsync retry logic
+                throw;
             }
         }
         DownloadProgressChanged?.Invoke(100, "Download complete.");
@@ -745,70 +755,6 @@ public sealed class ParakeetAsrService : IAsrService
 
         _core?.Dispose();
         _core = null;
-    }
-
-    private void EnsureOpenVinoRuntimePath()
-    {
-        var currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-
-        var candidateRoots = new List<string>
-        {
-            @"C:\Program Files (x86)\Intel\openvino_toolkit_windows_2026.1.0.21367.63e31528c62_x86_64"
-        };
-
-        var envRoot = Environment.GetEnvironmentVariable("OPENVINO_ROOT_DIR");
-        if (!string.IsNullOrWhiteSpace(envRoot))
-        {
-            candidateRoots.Add(envRoot);
-        }
-
-        foreach (var intelRoot in new[]
-                 {
-                     @"C:\Program Files (x86)\Intel",
-                     @"C:\Program Files\Intel"
-                 })
-        {
-            if (!Directory.Exists(intelRoot)) continue;
-
-            var dirs = Directory.GetDirectories(intelRoot, "openvino_toolkit_windows_*")
-                .OrderByDescending(d => d)
-                .ToArray();
-            candidateRoots.AddRange(dirs);
-        }
-
-        var additions = new List<string>();
-        foreach (var root in candidateRoots.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            if (!Directory.Exists(root)) continue;
-
-            var ovBin = Path.Combine(root, "runtime", "bin", "intel64", "Release");
-            var tbbBin = Path.Combine(root, "runtime", "3rdparty", "tbb", "bin");
-
-            if (Directory.Exists(ovBin) && !currentPath.Contains(ovBin, StringComparison.OrdinalIgnoreCase))
-            {
-                additions.Add(ovBin);
-            }
-
-            if (Directory.Exists(tbbBin) && !currentPath.Contains(tbbBin, StringComparison.OrdinalIgnoreCase))
-            {
-                additions.Add(tbbBin);
-            }
-
-            if (additions.Count > 0)
-            {
-                break;
-            }
-        }
-
-        if (additions.Count == 0)
-        {
-            return;
-        }
-
-        var newPath = string.Join(';', additions) + ";" + currentPath;
-        Environment.SetEnvironmentVariable("PATH", newPath);
-
-        Log.Information("Added OpenVINO runtime paths to PATH: {Paths}", string.Join(";", additions));
     }
 
     private void ThrowIfDisposed()
