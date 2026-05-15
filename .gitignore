@@ -5,8 +5,8 @@
 *.user
 
 # Data and Models
-models/
-logs/
+/models/
+/logs/
 
 # Optional: macOS/Windows specific
 .DS_Store
