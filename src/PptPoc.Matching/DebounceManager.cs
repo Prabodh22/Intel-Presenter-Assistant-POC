@@ -20,6 +20,9 @@ public class DebounceManager
     // Global cooldown
     private DateTime _lastGlobalHighlight = DateTime.MinValue;
 
+    private readonly Queue<string> _recentWinners = new Queue<string>();
+    private const int SlidingWindowSize = 5;
+
     public DebounceManager(AppConfig config)
     {
         _config = config;
@@ -29,27 +32,22 @@ public class DebounceManager
     /// Returns true if this element should be highlighted now.
     /// </summary>
     public bool ShouldHighlight(string elementId, double confidence, PptPoc.Core.Models.MatchType matchType)
-    {
-        var now = DateTime.UtcNow;
-
-        // Stability filter: same element must win N consecutive cycles
-        if (elementId == _lastWinner)
+    {liding window stability filter
+        _recentWinners.Enqueue(elementId);
+        if (_recentWinners.Count > SlidingWindowSize)
         {
-            _consecutiveWins.AddOrUpdate(elementId, 1, (_, count) => count + 1);
+            _recentWinners.Dequeue();
         }
-        else
-        {
-            _consecutiveWins.Clear();
-            _consecutiveWins[elementId] = 1;
-        }
-        _lastWinner = elementId;
 
         int requiredCycles = matchType == PptPoc.Core.Models.MatchType.ImageMatch 
-            ? _config.StabilityRequiredCycles * 3 
+            ? _config.StabilityRequiredCycles * 2 
             : _config.StabilityRequiredCycles;
 
-        int wins = _consecutiveWins.GetValueOrDefault(elementId, 0);
-        if (wins < requiredCycles)
+        int votes = _recentWinners.Count(x => x == elementId);
+        if (votes < requiredCycles)
+        {
+            Log.Debug("Element {ElementId} needs {Required} rolling votes, has {Current}",
+                elementId, requiredCycles, vote
         {
             Log.Debug("Element {ElementId} needs {Required} consecutive wins, has {Current}",
                 elementId, requiredCycles, wins);
@@ -88,6 +86,7 @@ public class DebounceManager
     {
         _lastHighlightTime.Clear();
         _consecutiveWins.Clear();
+        _recentWinners.Clear();
         _lastWinner = null;
         _lastGlobalHighlight = DateTime.MinValue;
     }

@@ -12,6 +12,7 @@ public class SlideReader : ISlideReader
     private static readonly ILogger Log = Serilog.Log.ForContext<SlideReader>();
 
     private readonly IOcrService? _ocr;
+    private readonly Dictionary<int, string> _ocrCache = new();
 
     public SlideReader(IOcrService? ocr = null)
     {
@@ -60,6 +61,17 @@ public class SlideReader : ISlideReader
                 var shapeId = ExtractShapeId(img.ElementId);
                 if (shapeId <= 0) continue;
 
+                if (_ocrCache.TryGetValue(shapeId, out var cachedText))
+                {
+                    img.ExtractedOcrText = cachedText;
+                    foreach (var word in TokenizeWords(NormalizeText(cachedText)))
+                    {
+                        if (!img.InferredKeywords.Contains(word))
+                            img.InferredKeywords.Add(word);
+                    }
+                    continue;
+                }
+
                 // Run COM export on task pool to avoid blocking the slide-read thread heavily
                 byte[]? imageBytes = await Task.Run(() => ExportShapeAsImage(slide, shapeId));
                 if (imageBytes == null || imageBytes.Length == 0) continue;
@@ -67,6 +79,7 @@ public class SlideReader : ISlideReader
                 var ocrText = await _ocr!.ExtractTextAsync(imageBytes);
                 if (!string.IsNullOrWhiteSpace(ocrText))
                 {
+                    _ocrCache[shapeId] = ocrText;
                     img.ExtractedOcrText = ocrText;
 
                     var ocrWords = TokenizeWords(NormalizeText(ocrText));
