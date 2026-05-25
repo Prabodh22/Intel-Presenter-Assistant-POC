@@ -32,6 +32,10 @@
                     Click="StartButton_Click" Background="#4CAF50" Foreground="White" FontWeight="Bold"/>
             <Button x:Name="StopButton" Content="Stop" Width="80" Height="30" Margin="0,0,8,0"
                     Click="StopButton_Click" Background="#F44336" Foreground="White" FontWeight="Bold" IsEnabled="False"/>
+            <Button x:Name="PreprocessButton" Content="Preprocess" Width="100" Height="30" Margin="0,0,8,0"
+                    Click="PreprocessButton_Click" Background="#2196F3" Foreground="White" FontWeight="Bold"/>
+            <Button x:Name="LoadKbButton" Content="Load KB" Width="80" Height="30" Margin="0,0,8,0"
+                    Click="LoadKbButton_Click" Background="#FF9800" Foreground="White" FontWeight="Bold"/>
             <TextBlock x:Name="SlideInfo" VerticalAlignment="Center" Margin="16,0,0,0" Foreground="Gray"/>
         </StackPanel>
 

@@ -32,8 +32,3 @@ This Proof of Concept (POC) is a real-time local C# application that listens to 
   - Added *Title Bias Penalties* so the model accurately prefers dense descriptive bullet blocks instead of artificially clamping to short slide titles.
   - Eliminated noise triggers ensuring short NLP stop-words ("the", "in") did not artificially trigger 1.0 confidence against short Alt-Text fallbacks.
   - Designed lean **Spatial Bounding Box Math Heuristics** allowing the app to instinctively understand "the image on the left" by mapping mathematically lowest bounding anchors (`Left`, `Top`) among current slide objects without needing the heavy 4GB overhead of a VLM.
-
-### Phase 4: Cross-Functional Memory Optimization
-- **Windows vs Linux Discrepancy:** During stress testing, we noticed that certain models were consuming roughly **2-3 GB more memory** on Windows 11 than they were under identical conditions on Linux.
-- **Deep Profiling:** We investigated this discrepancy deeply using native memory profilers, analyzing symbols and binary dumps to trace the allocation calls. 
-- **Collaboration & Resolution:** We pinpointed a memory leak and worked in a cross-functional capacity with the driver teams and the OpenVINO hardware team. The teams successfully isolated the issue, and the fix was rolled out in the next update, bringing Windows memory targets back in line with Linux expectations.

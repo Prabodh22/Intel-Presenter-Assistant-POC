@@ -8,8 +8,10 @@ public abstract class SlideElement
     public float Top { get; set; }
     public float Width { get; set; }
     public float Height { get; set; }
+    public int[] BoundingBox255 { get; set; } = new int[4]; // [x1, y1, x2, y2]
     public int ZOrder { get; set; }
     public float[]? SemanticEmbedding { get; set; }
+    public string GptDescription { get; set; } = string.Empty;
 }
 
 public class TextElement : SlideElement

@@ -20,6 +20,7 @@ public class Orchestrator : IOrchestrator
     private readonly IMatcherEngine _matcherEngine;
     private readonly IHighlightRenderer _renderer;
     private readonly DebounceManager _debounce;
+    private readonly KnowledgeBaseLoader? _kbLoader;
 
     private CancellationTokenSource? _cts;
     private Task? _processingTask;
@@ -62,7 +63,8 @@ public class Orchestrator : IOrchestrator
         ITranscriptProcessor transcriptProcessor,
         IMatcherEngine matcherEngine,
         IHighlightRenderer renderer,
-        DebounceManager debounce)
+        DebounceManager debounce,
+        KnowledgeBaseLoader? kbLoader = null)
     {
         _config = config;
         
@@ -83,6 +85,7 @@ public class Orchestrator : IOrchestrator
         _matcherEngine = matcherEngine;
         _renderer = renderer;
         _debounce = debounce;
+        _kbLoader = kbLoader;
     }
 
     public async Task StartAsync()
@@ -223,7 +226,10 @@ public class Orchestrator : IOrchestrator
                     
                     if (slideObj != null)
                     {
-                        var snapshot = _slideReader.ReadSlide(slideObj);
+                        // Use KB snapshot if available, otherwise read from COM
+                        var snapshot = _kbLoader?.IsLoaded == true
+                            ? _kbLoader.GetSnapshot(currentSlideIndex) ?? _slideReader.ReadSlide(slideObj)
+                            : _slideReader.ReadSlide(slideObj);
                         
                         // Clear the audio buffer to prevent audio from the previous slide leaking into the new slide's ASR
                         lock (_asrBufferLock)
@@ -308,7 +314,9 @@ public class Orchestrator : IOrchestrator
                     int slideIndex = _pptService.GetSlideIndexFromComObject(slideObj);
                     bool changed = slideIndex != _lastSlideIndex || _currentSnapshot == null;
                     SlideSnapshot? snapshot = changed
-                        ? _slideReader.ReadSlide(slideObj)
+                        ? (_kbLoader?.IsLoaded == true
+                            ? _kbLoader.GetSnapshot(slideIndex) ?? _slideReader.ReadSlide(slideObj)
+                            : _slideReader.ReadSlide(slideObj))
                         : null;
 
                     return (HasSlide: true, SlideIndex: slideIndex, Snapshot: snapshot, SlideChanged: changed);

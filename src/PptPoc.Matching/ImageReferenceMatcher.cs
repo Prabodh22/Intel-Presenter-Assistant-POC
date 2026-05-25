@@ -45,7 +45,14 @@ public static class ImageReferenceMatcher
             if (transcriptEmbedding != null && semanticService.IsReady)
             {
                 if (image.SemanticEmbedding == null)
-                    image.SemanticEmbedding = semanticService.GenerateEmbedding(image.ExtractedOcrText);
+                {
+                    // Prioritize GPT-4o's rich context over raw OCR
+                    string embedSource = string.IsNullOrWhiteSpace(image.GptDescription) 
+                        ? image.ExtractedOcrText 
+                        : image.GptDescription;
+
+                    image.SemanticEmbedding = semanticService.GenerateEmbedding(embedSource);
+                }
 
                 semanticOcr = semanticService.ComputeCosineSimilarity(transcriptEmbedding, image.SemanticEmbedding);
             }

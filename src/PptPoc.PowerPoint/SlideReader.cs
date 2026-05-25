@@ -12,11 +12,13 @@ public class SlideReader : ISlideReader
     private static readonly ILogger Log = Serilog.Log.ForContext<SlideReader>();
 
     private readonly IOcrService? _ocr;
+    private readonly IOpenAIVisionService? _gptVision;
     private readonly Dictionary<int, string> _ocrCache = new();
 
-    public SlideReader(IOcrService? ocr = null)
+    public SlideReader(IOcrService? ocr = null, IOpenAIVisionService? gptVision = null)
     {
         _ocr = ocr;
+        _gptVision = gptVision;
     }
 
     public SlideSnapshot ReadSlide(object slideComObject)
@@ -28,16 +30,30 @@ public class SlideReader : ISlideReader
             SlideId = slide.SlideID.ToString()
         };
 
+        float sW = 960f, sH = 540f;
+        try 
+        {
+            sW = slide.Master.Width;
+            sH = slide.Master.Height;
+        } 
+        catch { }
+
         try
         {
             foreach (Ppt.Shape shape in slide.Shapes)
             {
-                ProcessShape(shape, snapshot, null, slide);
+                ProcessShape(shape, snapshot, null, slide, sW, sH);
             }
         }
         catch (COMException ex)
         {
             Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
+        }
+
+        // Run GPT-4o Vision on entire slide
+        if (_gptVision != null && snapshot.ImageElements.Count > 0)
+        {
+            _ = RunGptVisionOnSlideAsync(snapshot, slide);
         }
 
         // Run OCR on all image elements asynchronously
@@ -50,6 +66,98 @@ public class SlideReader : ISlideReader
             snapshot.SlideIndex, snapshot.TextElements.Count, snapshot.ImageElements.Count);
 
         return snapshot;
+    }
+
+    /// <summary>
+    /// Reads a slide and awaits all async enrichment (OCR + GPT-4o vision).
+    /// Use for preprocessing where we need complete data before serializing.
+    /// </summary>
+    public async Task<SlideSnapshot> ReadSlideFullAsync(object slideComObject)
+    {
+        var slide = (Ppt.Slide)slideComObject;
+        var snapshot = new SlideSnapshot
+        {
+            SlideIndex = slide.SlideIndex,
+            SlideId = slide.SlideID.ToString()
+        };
+
+        float sW = 960f, sH = 540f;
+        try { sW = slide.Master.Width; sH = slide.Master.Height; } catch { }
+
+        try
+        {
+            foreach (Ppt.Shape shape in slide.Shapes)
+            {
+                ProcessShape(shape, snapshot, null, slide, sW, sH);
+            }
+        }
+        catch (COMException ex)
+        {
+            Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
+        }
+
+        // Await OCR and GPT-4o enrichment in parallel
+        var tasks = new List<Task>();
+
+        if (_ocr != null && snapshot.ImageElements.Count > 0)
+            tasks.Add(RunOcrOnImagesAsync(snapshot.ImageElements, slide));
+
+        if (_gptVision != null && snapshot.ImageElements.Count > 0)
+            tasks.Add(RunGptVisionOnSlideAsync(snapshot, slide));
+
+        if (tasks.Count > 0)
+            await Task.WhenAll(tasks);
+
+        Log.Information("ReadSlideFullAsync slide {SlideIndex}: {TextCount} text, {ImageCount} image (OCR+GPT awaited)",
+            snapshot.SlideIndex, snapshot.TextElements.Count, snapshot.ImageElements.Count);
+
+        return snapshot;
+    }
+
+    private async Task RunGptVisionOnSlideAsync(SlideSnapshot snapshot, Ppt.Slide slide)
+    {
+        try
+        {
+            var manifestParts = new List<string>();
+            foreach (var img in snapshot.ImageElements)
+            {
+                manifestParts.Add($"- Image ['{img.ElementId}']: box_2d [{img.BoundingBox255[0]}, {img.BoundingBox255[1]}, {img.BoundingBox255[2]}, {img.BoundingBox255[3]}], title '{img.Title}'");
+            }
+            foreach (var txt in snapshot.TextElements)
+            {
+                manifestParts.Add($"- Text ['{txt.ElementId}']: box_2d [{txt.BoundingBox255[0]}, {txt.BoundingBox255[1]}, {txt.BoundingBox255[2]}, {txt.BoundingBox255[3]}], content: \"{txt.RawText}\"");
+            }
+
+            string manifest = string.Join("\n", manifestParts);
+
+            var tempPath = Path.Combine(Path.GetTempPath(), $"slide_full_{Guid.NewGuid():N}.png");
+            slide.Export(tempPath, "PNG");
+            byte[] imageBytes = File.ReadAllBytes(tempPath);
+            File.Delete(tempPath);
+
+            string gptJson = await _gptVision!.AnalyzeSlideAsync(imageBytes, manifest);
+            
+            if (!string.IsNullOrWhiteSpace(gptJson))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(gptJson);
+                var elements = doc.RootElement.GetProperty("elements").EnumerateArray();
+                foreach (var el in elements)
+                {
+                    string id = el.GetProperty("id").GetString() ?? "";
+                    string desc = el.GetProperty("rich_description").GetString() ?? "";
+                    
+                    var imgTarget = snapshot.ImageElements.FirstOrDefault(x => x.ElementId == id);
+                    if (imgTarget != null) imgTarget.GptDescription = desc;
+                    
+                    var txtTarget = snapshot.TextElements.FirstOrDefault(x => x.ElementId == id);
+                    if (txtTarget != null) txtTarget.GptDescription = desc;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to run GPT-4o analysis on slide.");
+        }
     }
 
     private async Task RunOcrOnImagesAsync(List<ImageElement> images, Ppt.Slide slide)
@@ -140,7 +248,17 @@ public class SlideReader : ISlideReader
         }
     }
 
-    private void ProcessShape(Ppt.Shape shape, SlideSnapshot snapshot, string? groupPrefix, Ppt.Slide slide)
+    private static int[] CalcBox255(float left, float top, float width, float height, float sW, float sH)
+    {
+        return [
+            Math.Clamp((int)(left / sW * 255), 0, 255),
+            Math.Clamp((int)(top / sH * 255), 0, 255),
+            Math.Clamp((int)((left + width) / sW * 255), 0, 255),
+            Math.Clamp((int)((top + height) / sH * 255), 0, 255)
+        ];
+    }
+
+    private void ProcessShape(Ppt.Shape shape, SlideSnapshot snapshot, string? groupPrefix, Ppt.Slide slide, float sW, float sH)
     {
         string idPrefix = groupPrefix ?? "";
 
@@ -151,7 +269,7 @@ public class SlideReader : ISlideReader
             {
                 foreach (Ppt.Shape child in shape.GroupItems)
                 {
-                    ProcessShape(child, snapshot, $"{idPrefix}G{shape.Id}_", slide);
+                    ProcessShape(child, snapshot, $"{idPrefix}G{shape.Id}_", slide, sW, sH);
                 }
                 return;
             }
@@ -196,6 +314,7 @@ public class SlideReader : ISlideReader
                         Top            = pTop,
                         Width          = pWidth,
                         Height         = pHeight,
+                        BoundingBox255 = CalcBox255(pLeft, pTop, pWidth, pHeight, sW, sH),
                         ZOrder         = shape.ZOrderPosition,
                         RawText        = text,
                         NormalizedText = normalized,
@@ -223,6 +342,7 @@ public class SlideReader : ISlideReader
                     Top = shape.Top,
                     Width = shape.Width,
                     Height = shape.Height,
+                    BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
                     ZOrder = shape.ZOrderPosition,
                     AltText = altText,
                     Title = title,

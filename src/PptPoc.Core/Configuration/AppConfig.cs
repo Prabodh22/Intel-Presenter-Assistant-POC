@@ -2,6 +2,9 @@ namespace PptPoc.Core.Configuration;
 
 public class AppConfig
 {
+    public string OpenAIBaseUrl { get; set; } = "https://gnai.intel.com/api/providers/openai/v1";
+    public string OpenAIModel { get; set; } = "gpt-4o";
+
     public string ParakeetModelPath { get; set; } = "models/parakeet";
     public string SemanticModelPath { get; set; } = "models/minilm";
     public string OpenVinoDevice { get; set; } = "CPU";

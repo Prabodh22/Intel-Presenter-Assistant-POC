@@ -13,14 +13,11 @@ public class DebounceManager
     // Per-element cooldown tracking
     private readonly ConcurrentDictionary<string, DateTime> _lastHighlightTime = new();
 
-    // Stability tracking: element must win N consecutive cycles
-    private readonly ConcurrentDictionary<string, int> _consecutiveWins = new();
-    private string? _lastWinner;
-
     // Global cooldown
     private DateTime _lastGlobalHighlight = DateTime.MinValue;
 
-    private readonly Queue<string> _recentWinners = new Queue<string>();
+    // Sliding window stability: element must appear N times in last K cycles
+    private readonly Queue<string> _recentWinners = new();
     private const int SlidingWindowSize = 5;
 
     public DebounceManager(AppConfig config)
@@ -32,32 +29,32 @@ public class DebounceManager
     /// Returns true if this element should be highlighted now.
     /// </summary>
     public bool ShouldHighlight(string elementId, double confidence, PptPoc.Core.Models.MatchType matchType)
-    {liding window stability filter
+    {
+        var now = DateTime.UtcNow;
+
+        // Sliding window stability filter
         _recentWinners.Enqueue(elementId);
         if (_recentWinners.Count > SlidingWindowSize)
         {
             _recentWinners.Dequeue();
         }
 
-        int requiredCycles = matchType == PptPoc.Core.Models.MatchType.ImageMatch 
-            ? _config.StabilityRequiredCycles * 2 
+        int requiredCycles = matchType == PptPoc.Core.Models.MatchType.ImageMatch
+            ? _config.StabilityRequiredCycles * 2
             : _config.StabilityRequiredCycles;
 
         int votes = _recentWinners.Count(x => x == elementId);
         if (votes < requiredCycles)
         {
             Log.Debug("Element {ElementId} needs {Required} rolling votes, has {Current}",
-                elementId, requiredCycles, vote
-        {
-            Log.Debug("Element {ElementId} needs {Required} consecutive wins, has {Current}",
-                elementId, requiredCycles, wins);
+                elementId, requiredCycles, votes);
             return false;
         }
 
         // If this exact element was already highlighted recently, allow it to refresh without cooldown constraints.
         if (_lastHighlightTime.TryGetValue(elementId, out var lastTime) && (now - lastTime).TotalMilliseconds < _config.HighlightDurationMs)
         {
-             return true; 
+            return true;
         }
 
         // Global cooldown check for switching to a NEW element
@@ -85,9 +82,7 @@ public class DebounceManager
     public void Reset()
     {
         _lastHighlightTime.Clear();
-        _consecutiveWins.Clear();
         _recentWinners.Clear();
-        _lastWinner = null;
         _lastGlobalHighlight = DateTime.MinValue;
     }
 }
