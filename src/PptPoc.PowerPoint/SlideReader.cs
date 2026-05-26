@@ -4,6 +4,8 @@ using PptPoc.Core.Models;
 using Serilog;
 using Ppt = Microsoft.Office.Interop.PowerPoint;
 using Office = Microsoft.Office.Core;
+using Path = System.IO.Path;
+using File = System.IO.File;
 
 namespace PptPoc.PowerPoint;
 
@@ -12,10 +14,13 @@ public class SlideReader : ISlideReader
     private static readonly ILogger Log = Serilog.Log.ForContext<SlideReader>();
 
     private readonly IOcrService? _ocr;
+    private readonly IOpenAIVisionService? _gptVision;
+    private readonly Dictionary<int, List<OcrWordInfo>> _ocrCache = new();
 
-    public SlideReader(IOcrService? ocr = null)
+    public SlideReader(IOcrService? ocr = null, IOpenAIVisionService? gptVision = null)
     {
         _ocr = ocr;
+        _gptVision = gptVision;
     }
 
     public SlideSnapshot ReadSlide(object slideComObject)
@@ -27,16 +32,30 @@ public class SlideReader : ISlideReader
             SlideId = slide.SlideID.ToString()
         };
 
+        float sW = 960f, sH = 540f;
+        try 
+        {
+            sW = slide.Master.Width;
+            sH = slide.Master.Height;
+        } 
+        catch { }
+
         try
         {
             foreach (Ppt.Shape shape in slide.Shapes)
             {
-                ProcessShape(shape, snapshot, null, slide);
+                ProcessShape(shape, snapshot, null, slide, sW, sH);
             }
         }
         catch (COMException ex)
         {
             Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
+        }
+
+        // Run GPT-4o Vision on entire slide
+        if (_gptVision != null && snapshot.ImageElements.Count > 0)
+        {
+            _ = RunGptVisionOnSlideAsync(snapshot, slide);
         }
 
         // Run OCR on all image elements asynchronously
@@ -51,6 +70,98 @@ public class SlideReader : ISlideReader
         return snapshot;
     }
 
+    /// <summary>
+    /// Reads a slide and awaits all async enrichment (OCR + GPT-4o vision).
+    /// Use for preprocessing where we need complete data before serializing.
+    /// </summary>
+    public async Task<SlideSnapshot> ReadSlideFullAsync(object slideComObject)
+    {
+        var slide = (Ppt.Slide)slideComObject;
+        var snapshot = new SlideSnapshot
+        {
+            SlideIndex = slide.SlideIndex,
+            SlideId = slide.SlideID.ToString()
+        };
+
+        float sW = 960f, sH = 540f;
+        try { sW = slide.Master.Width; sH = slide.Master.Height; } catch { }
+
+        try
+        {
+            foreach (Ppt.Shape shape in slide.Shapes)
+            {
+                ProcessShape(shape, snapshot, null, slide, sW, sH);
+            }
+        }
+        catch (COMException ex)
+        {
+            Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
+        }
+
+        // Await OCR and GPT-4o enrichment in parallel
+        var tasks = new List<Task>();
+
+        if (_ocr != null && snapshot.ImageElements.Count > 0)
+            tasks.Add(RunOcrOnImagesAsync(snapshot.ImageElements, slide));
+
+        if (_gptVision != null && snapshot.ImageElements.Count > 0)
+            tasks.Add(RunGptVisionOnSlideAsync(snapshot, slide));
+
+        if (tasks.Count > 0)
+            await Task.WhenAll(tasks);
+
+        Log.Information("ReadSlideFullAsync slide {SlideIndex}: {TextCount} text, {ImageCount} image (OCR+GPT awaited)",
+            snapshot.SlideIndex, snapshot.TextElements.Count, snapshot.ImageElements.Count);
+
+        return snapshot;
+    }
+
+    private async Task RunGptVisionOnSlideAsync(SlideSnapshot snapshot, Ppt.Slide slide)
+    {
+        try
+        {
+            var manifestParts = new List<string>();
+            foreach (var img in snapshot.ImageElements)
+            {
+                manifestParts.Add($"- Image ['{img.ElementId}']: box_2d [{img.BoundingBox255[0]}, {img.BoundingBox255[1]}, {img.BoundingBox255[2]}, {img.BoundingBox255[3]}], title '{img.Title}'");
+            }
+            foreach (var txt in snapshot.TextElements)
+            {
+                manifestParts.Add($"- Text ['{txt.ElementId}']: box_2d [{txt.BoundingBox255[0]}, {txt.BoundingBox255[1]}, {txt.BoundingBox255[2]}, {txt.BoundingBox255[3]}], content: \"{txt.RawText}\"");
+            }
+
+            string manifest = string.Join("\n", manifestParts);
+
+            var tempPath = Path.Combine(Path.GetTempPath(), $"slide_full_{Guid.NewGuid():N}.png");
+            slide.Export(tempPath, "PNG");
+            byte[] imageBytes = File.ReadAllBytes(tempPath);
+            File.Delete(tempPath);
+
+            string gptJson = await _gptVision!.AnalyzeSlideAsync(imageBytes, manifest);
+            
+            if (!string.IsNullOrWhiteSpace(gptJson))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(gptJson);
+                var elements = doc.RootElement.GetProperty("elements").EnumerateArray();
+                foreach (var el in elements)
+                {
+                    string id = el.GetProperty("id").GetString() ?? "";
+                    string desc = el.GetProperty("rich_description").GetString() ?? "";
+                    
+                    var imgTarget = snapshot.ImageElements.FirstOrDefault(x => x.ElementId == id);
+                    if (imgTarget != null) imgTarget.GptDescription = desc;
+                    
+                    var txtTarget = snapshot.TextElements.FirstOrDefault(x => x.ElementId == id);
+                    if (txtTarget != null) txtTarget.GptDescription = desc;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to run GPT-4o analysis on slide.");
+        }
+    }
+
     private async Task RunOcrOnImagesAsync(List<ImageElement> images, Ppt.Slide slide)
     {
         foreach (var img in images)
@@ -60,24 +171,37 @@ public class SlideReader : ISlideReader
                 var shapeId = ExtractShapeId(img.ElementId);
                 if (shapeId <= 0) continue;
 
+                if (_ocrCache.TryGetValue(shapeId, out var cachedWords))
+                {
+                    img.ExtractedWords = cachedWords;
+                    var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
+                    foreach (var word in TokenizeWords(NormalizeText(combinedText)))
+                    {
+                        if (!img.InferredKeywords.Contains(word))
+                            img.InferredKeywords.Add(word);
+                    }
+                    continue;
+                }
+
                 // Run COM export on task pool to avoid blocking the slide-read thread heavily
                 byte[]? imageBytes = await Task.Run(() => ExportShapeAsImage(slide, shapeId));
                 if (imageBytes == null || imageBytes.Length == 0) continue;
 
-                var ocrText = await _ocr!.ExtractTextAsync(imageBytes);
-                if (!string.IsNullOrWhiteSpace(ocrText))
+                var ocrWords = await _ocr!.ExtractTextAsync(imageBytes);
+                if (ocrWords.Count > 0)
                 {
-                    img.ExtractedOcrText = ocrText;
+                    _ocrCache[shapeId] = ocrWords;
+                    img.ExtractedWords = ocrWords;
 
-                    var ocrWords = TokenizeWords(NormalizeText(ocrText));
-                    foreach (var word in ocrWords)
+                    var combinedText = string.Join(" ", ocrWords.Select(w => w.Text));
+                    var tokenized = TokenizeWords(NormalizeText(combinedText));
+                    foreach (var word in tokenized)
                     {
                         if (!img.InferredKeywords.Contains(word))
                             img.InferredKeywords.Add(word);
                     }
 
-                    Log.Debug("OCR on shape {Id}: \"{Text}\"", shapeId,
-                        ocrText.Length > 80 ? ocrText[..80] + "…" : ocrText);
+                    Log.Debug("OCR on shape {Id}: {Count} words extracted", shapeId, ocrWords.Count);
                 }
             }
             catch (Exception ex)
@@ -89,12 +213,14 @@ public class SlideReader : ISlideReader
 
     private static int ExtractShapeId(string elementId)
     {
-        // Element ID format: "{prefix}I{shapeId}_{slideIndex}"
+        // Element ID format: "{prefix}I{shapeId}_{slideIndex}" or "{prefix}C{shapeId}_{slideIndex}" (charts)
         var iIdx = elementId.LastIndexOf('I');
-        if (iIdx < 0) return 0;
-        var afterI = elementId[(iIdx + 1)..];
-        var underIdx = afterI.IndexOf('_');
-        var idStr = underIdx >= 0 ? afterI[..underIdx] : afterI;
+        var cIdx = elementId.LastIndexOf('C');
+        var prefixIdx = Math.Max(iIdx, cIdx);
+        if (prefixIdx < 0) return 0;
+        var afterPrefix = elementId[(prefixIdx + 1)..];
+        var underIdx = afterPrefix.IndexOf('_');
+        var idStr = underIdx >= 0 ? afterPrefix[..underIdx] : afterPrefix;
         return int.TryParse(idStr, out int id) ? id : 0;
     }
 
@@ -127,7 +253,17 @@ public class SlideReader : ISlideReader
         }
     }
 
-    private void ProcessShape(Ppt.Shape shape, SlideSnapshot snapshot, string? groupPrefix, Ppt.Slide slide)
+    private static int[] CalcBox255(float left, float top, float width, float height, float sW, float sH)
+    {
+        return [
+            Math.Clamp((int)(left / sW * 255), 0, 255),
+            Math.Clamp((int)(top / sH * 255), 0, 255),
+            Math.Clamp((int)((left + width) / sW * 255), 0, 255),
+            Math.Clamp((int)((top + height) / sH * 255), 0, 255)
+        ];
+    }
+
+    private void ProcessShape(Ppt.Shape shape, SlideSnapshot snapshot, string? groupPrefix, Ppt.Slide slide, float sW, float sH)
     {
         string idPrefix = groupPrefix ?? "";
 
@@ -138,7 +274,7 @@ public class SlideReader : ISlideReader
             {
                 foreach (Ppt.Shape child in shape.GroupItems)
                 {
-                    ProcessShape(child, snapshot, $"{idPrefix}G{shape.Id}_", slide);
+                    ProcessShape(child, snapshot, $"{idPrefix}G{shape.Id}_", slide, sW, sH);
                 }
                 return;
             }
@@ -183,12 +319,176 @@ public class SlideReader : ISlideReader
                         Top            = pTop,
                         Width          = pWidth,
                         Height         = pHeight,
+                        BoundingBox255 = CalcBox255(pLeft, pTop, pWidth, pHeight, sW, sH),
                         ZOrder         = shape.ZOrderPosition,
                         RawText        = text,
                         NormalizedText = normalized,
                         Words          = TokenizeWords(normalized),
                         ParagraphIndex = pi
                     });
+                }
+            }
+
+            // Extract table cells as individual text elements
+            if (shape.HasTable == Office.MsoTriState.msoTrue)
+            {
+                try
+                {
+                    var table = shape.Table;
+                    for (int row = 1; row <= table.Rows.Count; row++)
+                    {
+                        for (int col = 1; col <= table.Columns.Count; col++)
+                        {
+                            try
+                            {
+                                var cell = table.Cell(row, col);
+                                var cellText = cell.Shape.TextFrame.TextRange.Text?.Trim('\r', '\v', '\n', ' ');
+                                if (string.IsNullOrWhiteSpace(cellText)) continue;
+
+                                // Approximate cell position from shape bounds and grid proportions
+                                float cellLeft = shape.Left + (float)(col - 1) / table.Columns.Count * shape.Width;
+                                float cellTop = shape.Top + (float)(row - 1) / table.Rows.Count * shape.Height;
+                                float cellWidth = shape.Width / table.Columns.Count;
+                                float cellHeight = shape.Height / table.Rows.Count;
+
+                                var normalized = NormalizeText(cellText);
+                                snapshot.TextElements.Add(new TextElement
+                                {
+                                    ElementId      = $"{idPrefix}T{shape.Id}_{snapshot.SlideIndex}_R{row}C{col}",
+                                    ShapeName      = $"{shape.Name}:R{row}C{col}",
+                                    Left           = cellLeft,
+                                    Top            = cellTop,
+                                    Width          = cellWidth,
+                                    Height         = cellHeight,
+                                    BoundingBox255 = CalcBox255(cellLeft, cellTop, cellWidth, cellHeight, sW, sH),
+                                    ZOrder         = shape.ZOrderPosition,
+                                    RawText        = cellText,
+                                    NormalizedText = normalized,
+                                    Words          = TokenizeWords(normalized),
+                                    ParagraphIndex = 0
+                                });
+                            }
+                            catch (COMException) { /* merged cell or inaccessible */ }
+                        }
+                    }
+                    Log.Debug("Extracted table {ShapeName} on slide {SlideIndex}: {Rows}x{Cols}",
+                        shape.Name, snapshot.SlideIndex, table.Rows.Count, table.Columns.Count);
+                }
+                catch (COMException ex)
+                {
+                    Log.Warning(ex, "Error reading table shape {ShapeName}", shape.Name);
+                }
+            }
+
+            // Extract chart as an image element (OCR will read the labels)
+            // AND extract chart data (categories, series, title) as text elements
+            if (shape.HasChart == Office.MsoTriState.msoTrue)
+            {
+                var altText = GetAltText(shape);
+                var title = GetTitle(shape);
+                var nearbyText = FindNearbyText(shape, snapshot);
+                var keywords = InferKeywords(altText, title, nearbyText);
+
+                snapshot.ImageElements.Add(new ImageElement
+                {
+                    ElementId = $"{idPrefix}C{shape.Id}_{snapshot.SlideIndex}",
+                    ShapeName = shape.Name,
+                    Left = shape.Left,
+                    Top = shape.Top,
+                    Width = shape.Width,
+                    Height = shape.Height,
+                    BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
+                    ZOrder = shape.ZOrderPosition,
+                    AltText = altText,
+                    Title = title,
+                    NearbyText = nearbyText,
+                    InferredKeywords = keywords
+                });
+
+                // Extract chart text data (categories, series names, chart title) as TextElements
+                try
+                {
+                    var chart = shape.Chart;
+                    var chartTexts = new List<string>();
+
+                    // Chart title
+                    try
+                    {
+                        if (chart.HasTitle && chart.ChartTitle != null)
+                        {
+                            var ct = chart.ChartTitle.Text?.Trim();
+                            if (!string.IsNullOrWhiteSpace(ct)) chartTexts.Add(ct);
+                        }
+                    }
+                    catch (COMException) { }
+
+                    // Category names from the first series (X-axis labels)
+                    try
+                    {
+                        dynamic seriesColl = chart.SeriesCollection();
+                        int seriesCount = (int)seriesColl.Count;
+
+                        // Get category names from first series XValues
+                        try
+                        {
+                            dynamic firstSeries = seriesColl.Item(1);
+                            object xValsObj = firstSeries.XValues;
+                            if (xValsObj is object[] xVals)
+                            {
+                                foreach (var xv in xVals)
+                                {
+                                    var s = xv?.ToString()?.Trim();
+                                    if (!string.IsNullOrWhiteSpace(s)) chartTexts.Add(s);
+                                }
+                            }
+                        }
+                        catch (COMException) { }
+
+                        // Series names
+                        for (int si = 1; si <= seriesCount; si++)
+                        {
+                            try
+                            {
+                                dynamic series = seriesColl.Item(si);
+                                string? sn = (string?)series.Name;
+                                if (!string.IsNullOrWhiteSpace(sn)) chartTexts.Add(sn.Trim());
+                            }
+                            catch (COMException) { }
+                        }
+                    }
+                    catch (COMException) { }
+
+                    // Add each unique chart text as a TextElement positioned inside the chart
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    int ci = 0;
+                    foreach (var ct in chartTexts)
+                    {
+                        if (!seen.Add(ct)) continue;
+                        ci++;
+                        var normalized = NormalizeText(ct);
+                        snapshot.TextElements.Add(new TextElement
+                        {
+                            ElementId      = $"{idPrefix}CT{shape.Id}_{snapshot.SlideIndex}_{ci}",
+                            ShapeName      = $"{shape.Name}:Label{ci}",
+                            Left           = shape.Left,
+                            Top            = shape.Top,
+                            Width          = shape.Width,
+                            Height         = shape.Height,
+                            BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
+                            ZOrder         = shape.ZOrderPosition,
+                            RawText        = ct,
+                            NormalizedText = normalized,
+                            Words          = TokenizeWords(normalized),
+                            ParagraphIndex = 0
+                        });
+                    }
+
+                    Log.Debug("Extracted chart {ShapeName} on slide {SlideIndex}: {Count} text labels + image element",
+                        shape.Name, snapshot.SlideIndex, ci);
+                }
+                catch (COMException ex)
+                {
+                    Log.Warning(ex, "Error reading chart data from {ShapeName}", shape.Name);
                 }
             }
 
@@ -210,6 +510,7 @@ public class SlideReader : ISlideReader
                     Top = shape.Top,
                     Width = shape.Width,
                     Height = shape.Height,
+                    BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
                     ZOrder = shape.ZOrderPosition,
                     AltText = altText,
                     Title = title,

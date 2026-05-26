@@ -58,6 +58,11 @@ public class MatcherEngine : IMatcherEngine
             double combinedScore = Math.Max(fuzzyScore, semanticScore);
             string phrase = fuzzyScore > semanticScore ? fuzzyPhrase : transcriptText;
 
+            // For very short text elements (≤2 words), semantic embeddings are unreliable.
+            // Require some fuzzy evidence before trusting the score.
+            if (textElem.Words.Count <= 2 && fuzzyScore < 0.01)
+                combinedScore = 0.0;
+
             double confidence = _scorer.ComputeConfidence(combinedScore, MatchType.TextMatch, textElem);
 
             if (_scorer.MeetsThreshold(confidence))
@@ -76,14 +81,30 @@ public class MatcherEngine : IMatcherEngine
         for (int i = 0; i < snapshot.ImageElements.Count; i++)
         {
             var imgElem = snapshot.ImageElements[i];
-            var (score, phrase) = ImageReferenceMatcher.Score(transcriptText, transcriptEmbedding, imgElem, i, snapshot.ImageElements, _semanticService);
+            var (score, phrase, targetWord) = ImageReferenceMatcher.Score(transcriptText, transcriptEmbedding, imgElem, i, snapshot.ImageElements, _semanticService);
             double confidence = _scorer.ComputeConfidence(score, MatchType.ImageMatch, imgElem);
 
             if (_scorer.MeetsThreshold(confidence))
             {
+                SlideElement elementToReport = imgElem;
+                
+                if (targetWord != null)
+                {
+                    // Create proxy slide element for precise bounding box
+                    elementToReport = new ImageElement
+                    {
+                        ElementId = imgElem.ElementId + "_ocr_" + targetWord.Text,
+                        ShapeName = imgElem.ShapeName,
+                        Left = imgElem.Left + (float)(targetWord.X * imgElem.Width),
+                        Top = imgElem.Top + (float)(targetWord.Y * imgElem.Height),
+                        Width = (float)(targetWord.Width * imgElem.Width),
+                        Height = (float)(targetWord.Height * imgElem.Height)
+                    };
+                }
+
                 results.Add(new MatchResult
                 {
-                    Element = imgElem,
+                    Element = elementToReport,
                     Confidence = confidence,
                     Type = MatchType.ImageMatch,
                     MatchedPhrase = phrase

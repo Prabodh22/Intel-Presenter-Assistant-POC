@@ -1,3 +1,5 @@
+using PptPoc.Core.Models;
+
 namespace PptPoc.Core.Interfaces;
 
 /// <summary>
@@ -9,8 +11,8 @@ public interface IOcrService : IDisposable
     Task InitializeAsync();
 
     /// <summary>Extract text from a PNG/JPG image supplied as raw bytes.</summary>
-    Task<string> ExtractTextAsync(byte[] imageData);
+    Task<List<OcrWordInfo>> ExtractTextAsync(byte[] imageData);
 
     /// <summary>Extract text from an image file on disk.</summary>
-    Task<string> ExtractTextAsync(string imagePath);
+    Task<List<OcrWordInfo>> ExtractTextAsync(string imagePath);
 }

@@ -27,13 +27,21 @@ public class ConfidenceScorer
                 adjusted -= 0.1;
         }
 
+        // Image matches need a higher bar — they're more disruptive when wrong
+        if (type == MatchType.ImageMatch)
+        {
+            adjusted -= 0.1;
+        }
+
         // Penalty for titles to favor denser text elements
         if (element.ShapeName.Contains("Title", StringComparison.OrdinalIgnoreCase))
         {
             adjusted -= 0.15;
         }
 
-        return Math.Max(0.0, Math.Min(1.0, adjusted));
+        // Allow scores slightly above 1.0 to preserve depth-based tiebreaking
+        // from FuzzyMatcher (up to +0.15 for elements with many matching words).
+        return Math.Max(0.0, Math.Min(1.15, adjusted));
     }
 
     public bool MeetsThreshold(double confidence)

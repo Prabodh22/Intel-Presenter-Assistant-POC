@@ -8,8 +8,10 @@ public abstract class SlideElement
     public float Top { get; set; }
     public float Width { get; set; }
     public float Height { get; set; }
+    public int[] BoundingBox255 { get; set; } = new int[4]; // [x1, y1, x2, y2]
     public int ZOrder { get; set; }
     public float[]? SemanticEmbedding { get; set; }
+    public string GptDescription { get; set; } = string.Empty;
 }
 
 public class TextElement : SlideElement
@@ -22,7 +24,7 @@ public class TextElement : SlideElement
 
 public class ImageElement : SlideElement
 {
-    public string ExtractedOcrText { get; set; } = string.Empty;
+    public List<OcrWordInfo> ExtractedWords { get; set; } = new();
     public string AltText { get; set; } = string.Empty;
     public string ProximityText { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;

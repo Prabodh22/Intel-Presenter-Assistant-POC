@@ -15,7 +15,8 @@ public class MicrophoneCaptureService : IAudioCaptureService
 
     private readonly AppConfig _config;
     private WaveInEvent? _waveIn;
-    private readonly List<float> _chunkBuffer = new();
+    private float[] _internalBuffer = new float[16000 * 5]; // 5 seconds initial capacity
+    private int _bufferHead = 0;
     private readonly object _bufferLock = new();
     private int _samplesPerChunk;
     private bool _disposed;
@@ -73,7 +74,7 @@ public class MicrophoneCaptureService : IAudioCaptureService
 
         lock (_bufferLock)
         {
-            _chunkBuffer.Clear();
+            _bufferHead = 0;
         }
 
         Log.Information("Microphone capture stopped");
@@ -81,25 +82,32 @@ public class MicrophoneCaptureService : IAudioCaptureService
 
     private void OnDataAvailable(object? sender, WaveInEventArgs e)
     {
-        // Convert Int16 PCM bytes to float32 samples
         int sampleCount = e.BytesRecorded / 2; // 16-bit = 2 bytes per sample
-        var samples = new float[sampleCount];
-
-        for (int i = 0; i < sampleCount; i++)
-        {
-            short sample = BitConverter.ToInt16(e.Buffer, i * 2);
-            samples[i] = sample / 32768f;
-        }
 
         lock (_bufferLock)
         {
-            _chunkBuffer.AddRange(samples);
+            // Ensure capacity
+            if (_bufferHead + sampleCount > _internalBuffer.Length)
+            {
+                Array.Resize(ref _internalBuffer, Math.Max(_internalBuffer.Length * 2, _bufferHead + sampleCount));
+            }
+
+            // Convert and place directly into buffer avoiding temporary arrays
+            for (int i = 0; i < sampleCount; i++)
+            {
+                short sample = BitConverter.ToInt16(e.Buffer, i * 2);
+                _internalBuffer[_bufferHead + i] = sample / 32768f;
+            }
+            
+            _bufferHead += sampleCount;
+            int offset = 0;
 
             // Emit chunks when we have enough samples
-            while (_chunkBuffer.Count >= _samplesPerChunk)
+            while (_bufferHead - offset >= _samplesPerChunk)
             {
-                var chunk = _chunkBuffer.GetRange(0, _samplesPerChunk).ToArray();
-                _chunkBuffer.RemoveRange(0, _samplesPerChunk);
+                var chunk = new float[_samplesPerChunk];
+                Array.Copy(_internalBuffer, offset, chunk, 0, _samplesPerChunk);
+                offset += _samplesPerChunk;
 
                 try
                 {
@@ -109,6 +117,17 @@ public class MicrophoneCaptureService : IAudioCaptureService
                 {
                     Log.Error(ex, "Error in AudioChunkReady handler");
                 }
+            }
+
+            // Shift remaining partial samples back to front
+            if (offset > 0)
+            {
+                int remaining = _bufferHead - offset;
+                if (remaining > 0)
+                {
+                    Array.Copy(_internalBuffer, offset, _internalBuffer, 0, remaining);
+                }
+                _bufferHead = remaining;
             }
         }
     }
