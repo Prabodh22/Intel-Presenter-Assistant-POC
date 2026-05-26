@@ -16,6 +16,12 @@ public class DebounceManager
     // Global cooldown
     private DateTime _lastGlobalHighlight = DateTime.MinValue;
 
+    // Stickiness: prevent oscillation between elements with similar scores
+    private string? _currentElementId;
+    private double _currentConfidence;
+    private DateTime _currentHighlightStart = DateTime.MinValue;
+    private const double StickinessMargin = 0.10; // New element must beat current by this margin
+
     // Sliding window stability: element must appear N times in last K cycles
     private readonly Queue<string> _recentWinners = new();
     private const int SlidingWindowSize = 5;
@@ -51,10 +57,23 @@ public class DebounceManager
             return false;
         }
 
-        // If this exact element was already highlighted recently, allow it to refresh without cooldown constraints.
-        if (_lastHighlightTime.TryGetValue(elementId, out var lastTime) && (now - lastTime).TotalMilliseconds < _config.HighlightDurationMs)
+        // If this exact element was already highlighted recently, SKIP it — don't keep re-triggering the laser.
+        if (_lastHighlightTime.TryGetValue(elementId, out var lastTime) && (now - lastTime).TotalMilliseconds < _config.CooldownMs)
         {
-            return true;
+            return false;
+        }
+
+        // Stickiness: if switching to a DIFFERENT element while the current one is still "alive",
+        // require the new element to beat it by a meaningful margin to prevent oscillation.
+        if (_currentElementId != null && _currentElementId != elementId
+            && (now - _currentHighlightStart).TotalMilliseconds < _config.HighlightDurationMs + _config.CooldownMs)
+        {
+            if (confidence < _currentConfidence + StickinessMargin)
+            {
+                Log.Debug("Stickiness: {NewElement} ({NewConf:F2}) not enough margin over current {CurElement} ({CurConf:F2})",
+                    elementId, confidence, _currentElementId, _currentConfidence);
+                return false;
+            }
         }
 
         // Global cooldown check for switching to a NEW element
@@ -70,11 +89,21 @@ public class DebounceManager
     /// <summary>
     /// Records that a highlight was applied for this element.
     /// </summary>
-    public void RecordHighlight(string elementId)
+    public void RecordHighlight(string elementId, double confidence = 1.0)
     {
         var now = DateTime.UtcNow;
         _lastHighlightTime[elementId] = now;
         _lastGlobalHighlight = now;
+
+        // Only reset stickiness timer when switching to a DIFFERENT element.
+        // Re-highlighting the same element should NOT extend the stickiness window,
+        // otherwise transitions to other elements are blocked indefinitely.
+        if (_currentElementId != elementId)
+        {
+            _currentElementId = elementId;
+            _currentHighlightStart = now;
+        }
+        _currentConfidence = confidence;
 
         Log.Debug("Recorded highlight for {ElementId}", elementId);
     }
@@ -84,5 +113,8 @@ public class DebounceManager
         _lastHighlightTime.Clear();
         _recentWinners.Clear();
         _lastGlobalHighlight = DateTime.MinValue;
+        _currentElementId = null;
+        _currentConfidence = 0;
+        _currentHighlightStart = DateTime.MinValue;
     }
 }

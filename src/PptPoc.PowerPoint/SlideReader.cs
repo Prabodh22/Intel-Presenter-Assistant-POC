@@ -4,6 +4,8 @@ using PptPoc.Core.Models;
 using Serilog;
 using Ppt = Microsoft.Office.Interop.PowerPoint;
 using Office = Microsoft.Office.Core;
+using Path = System.IO.Path;
+using File = System.IO.File;
 
 namespace PptPoc.PowerPoint;
 
@@ -13,7 +15,7 @@ public class SlideReader : ISlideReader
 
     private readonly IOcrService? _ocr;
     private readonly IOpenAIVisionService? _gptVision;
-    private readonly Dictionary<int, string> _ocrCache = new();
+    private readonly Dictionary<int, List<OcrWordInfo>> _ocrCache = new();
 
     public SlideReader(IOcrService? ocr = null, IOpenAIVisionService? gptVision = null)
     {
@@ -169,10 +171,11 @@ public class SlideReader : ISlideReader
                 var shapeId = ExtractShapeId(img.ElementId);
                 if (shapeId <= 0) continue;
 
-                if (_ocrCache.TryGetValue(shapeId, out var cachedText))
+                if (_ocrCache.TryGetValue(shapeId, out var cachedWords))
                 {
-                    img.ExtractedOcrText = cachedText;
-                    foreach (var word in TokenizeWords(NormalizeText(cachedText)))
+                    img.ExtractedWords = cachedWords;
+                    var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
+                    foreach (var word in TokenizeWords(NormalizeText(combinedText)))
                     {
                         if (!img.InferredKeywords.Contains(word))
                             img.InferredKeywords.Add(word);
@@ -184,21 +187,21 @@ public class SlideReader : ISlideReader
                 byte[]? imageBytes = await Task.Run(() => ExportShapeAsImage(slide, shapeId));
                 if (imageBytes == null || imageBytes.Length == 0) continue;
 
-                var ocrText = await _ocr!.ExtractTextAsync(imageBytes);
-                if (!string.IsNullOrWhiteSpace(ocrText))
+                var ocrWords = await _ocr!.ExtractTextAsync(imageBytes);
+                if (ocrWords.Count > 0)
                 {
-                    _ocrCache[shapeId] = ocrText;
-                    img.ExtractedOcrText = ocrText;
+                    _ocrCache[shapeId] = ocrWords;
+                    img.ExtractedWords = ocrWords;
 
-                    var ocrWords = TokenizeWords(NormalizeText(ocrText));
-                    foreach (var word in ocrWords)
+                    var combinedText = string.Join(" ", ocrWords.Select(w => w.Text));
+                    var tokenized = TokenizeWords(NormalizeText(combinedText));
+                    foreach (var word in tokenized)
                     {
                         if (!img.InferredKeywords.Contains(word))
                             img.InferredKeywords.Add(word);
                     }
 
-                    Log.Debug("OCR on shape {Id}: \"{Text}\"", shapeId,
-                        ocrText.Length > 80 ? ocrText[..80] + "…" : ocrText);
+                    Log.Debug("OCR on shape {Id}: {Count} words extracted", shapeId, ocrWords.Count);
                 }
             }
             catch (Exception ex)
@@ -210,12 +213,14 @@ public class SlideReader : ISlideReader
 
     private static int ExtractShapeId(string elementId)
     {
-        // Element ID format: "{prefix}I{shapeId}_{slideIndex}"
+        // Element ID format: "{prefix}I{shapeId}_{slideIndex}" or "{prefix}C{shapeId}_{slideIndex}" (charts)
         var iIdx = elementId.LastIndexOf('I');
-        if (iIdx < 0) return 0;
-        var afterI = elementId[(iIdx + 1)..];
-        var underIdx = afterI.IndexOf('_');
-        var idStr = underIdx >= 0 ? afterI[..underIdx] : afterI;
+        var cIdx = elementId.LastIndexOf('C');
+        var prefixIdx = Math.Max(iIdx, cIdx);
+        if (prefixIdx < 0) return 0;
+        var afterPrefix = elementId[(prefixIdx + 1)..];
+        var underIdx = afterPrefix.IndexOf('_');
+        var idStr = underIdx >= 0 ? afterPrefix[..underIdx] : afterPrefix;
         return int.TryParse(idStr, out int id) ? id : 0;
     }
 
@@ -321,6 +326,169 @@ public class SlideReader : ISlideReader
                         Words          = TokenizeWords(normalized),
                         ParagraphIndex = pi
                     });
+                }
+            }
+
+            // Extract table cells as individual text elements
+            if (shape.HasTable == Office.MsoTriState.msoTrue)
+            {
+                try
+                {
+                    var table = shape.Table;
+                    for (int row = 1; row <= table.Rows.Count; row++)
+                    {
+                        for (int col = 1; col <= table.Columns.Count; col++)
+                        {
+                            try
+                            {
+                                var cell = table.Cell(row, col);
+                                var cellText = cell.Shape.TextFrame.TextRange.Text?.Trim('\r', '\v', '\n', ' ');
+                                if (string.IsNullOrWhiteSpace(cellText)) continue;
+
+                                // Approximate cell position from shape bounds and grid proportions
+                                float cellLeft = shape.Left + (float)(col - 1) / table.Columns.Count * shape.Width;
+                                float cellTop = shape.Top + (float)(row - 1) / table.Rows.Count * shape.Height;
+                                float cellWidth = shape.Width / table.Columns.Count;
+                                float cellHeight = shape.Height / table.Rows.Count;
+
+                                var normalized = NormalizeText(cellText);
+                                snapshot.TextElements.Add(new TextElement
+                                {
+                                    ElementId      = $"{idPrefix}T{shape.Id}_{snapshot.SlideIndex}_R{row}C{col}",
+                                    ShapeName      = $"{shape.Name}:R{row}C{col}",
+                                    Left           = cellLeft,
+                                    Top            = cellTop,
+                                    Width          = cellWidth,
+                                    Height         = cellHeight,
+                                    BoundingBox255 = CalcBox255(cellLeft, cellTop, cellWidth, cellHeight, sW, sH),
+                                    ZOrder         = shape.ZOrderPosition,
+                                    RawText        = cellText,
+                                    NormalizedText = normalized,
+                                    Words          = TokenizeWords(normalized),
+                                    ParagraphIndex = 0
+                                });
+                            }
+                            catch (COMException) { /* merged cell or inaccessible */ }
+                        }
+                    }
+                    Log.Debug("Extracted table {ShapeName} on slide {SlideIndex}: {Rows}x{Cols}",
+                        shape.Name, snapshot.SlideIndex, table.Rows.Count, table.Columns.Count);
+                }
+                catch (COMException ex)
+                {
+                    Log.Warning(ex, "Error reading table shape {ShapeName}", shape.Name);
+                }
+            }
+
+            // Extract chart as an image element (OCR will read the labels)
+            // AND extract chart data (categories, series, title) as text elements
+            if (shape.HasChart == Office.MsoTriState.msoTrue)
+            {
+                var altText = GetAltText(shape);
+                var title = GetTitle(shape);
+                var nearbyText = FindNearbyText(shape, snapshot);
+                var keywords = InferKeywords(altText, title, nearbyText);
+
+                snapshot.ImageElements.Add(new ImageElement
+                {
+                    ElementId = $"{idPrefix}C{shape.Id}_{snapshot.SlideIndex}",
+                    ShapeName = shape.Name,
+                    Left = shape.Left,
+                    Top = shape.Top,
+                    Width = shape.Width,
+                    Height = shape.Height,
+                    BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
+                    ZOrder = shape.ZOrderPosition,
+                    AltText = altText,
+                    Title = title,
+                    NearbyText = nearbyText,
+                    InferredKeywords = keywords
+                });
+
+                // Extract chart text data (categories, series names, chart title) as TextElements
+                try
+                {
+                    var chart = shape.Chart;
+                    var chartTexts = new List<string>();
+
+                    // Chart title
+                    try
+                    {
+                        if (chart.HasTitle && chart.ChartTitle != null)
+                        {
+                            var ct = chart.ChartTitle.Text?.Trim();
+                            if (!string.IsNullOrWhiteSpace(ct)) chartTexts.Add(ct);
+                        }
+                    }
+                    catch (COMException) { }
+
+                    // Category names from the first series (X-axis labels)
+                    try
+                    {
+                        dynamic seriesColl = chart.SeriesCollection();
+                        int seriesCount = (int)seriesColl.Count;
+
+                        // Get category names from first series XValues
+                        try
+                        {
+                            dynamic firstSeries = seriesColl.Item(1);
+                            object xValsObj = firstSeries.XValues;
+                            if (xValsObj is object[] xVals)
+                            {
+                                foreach (var xv in xVals)
+                                {
+                                    var s = xv?.ToString()?.Trim();
+                                    if (!string.IsNullOrWhiteSpace(s)) chartTexts.Add(s);
+                                }
+                            }
+                        }
+                        catch (COMException) { }
+
+                        // Series names
+                        for (int si = 1; si <= seriesCount; si++)
+                        {
+                            try
+                            {
+                                dynamic series = seriesColl.Item(si);
+                                string? sn = (string?)series.Name;
+                                if (!string.IsNullOrWhiteSpace(sn)) chartTexts.Add(sn.Trim());
+                            }
+                            catch (COMException) { }
+                        }
+                    }
+                    catch (COMException) { }
+
+                    // Add each unique chart text as a TextElement positioned inside the chart
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    int ci = 0;
+                    foreach (var ct in chartTexts)
+                    {
+                        if (!seen.Add(ct)) continue;
+                        ci++;
+                        var normalized = NormalizeText(ct);
+                        snapshot.TextElements.Add(new TextElement
+                        {
+                            ElementId      = $"{idPrefix}CT{shape.Id}_{snapshot.SlideIndex}_{ci}",
+                            ShapeName      = $"{shape.Name}:Label{ci}",
+                            Left           = shape.Left,
+                            Top            = shape.Top,
+                            Width          = shape.Width,
+                            Height         = shape.Height,
+                            BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
+                            ZOrder         = shape.ZOrderPosition,
+                            RawText        = ct,
+                            NormalizedText = normalized,
+                            Words          = TokenizeWords(normalized),
+                            ParagraphIndex = 0
+                        });
+                    }
+
+                    Log.Debug("Extracted chart {ShapeName} on slide {SlideIndex}: {Count} text labels + image element",
+                        shape.Name, snapshot.SlideIndex, ci);
+                }
+                catch (COMException ex)
+                {
+                    Log.Warning(ex, "Error reading chart data from {ShapeName}", shape.Name);
                 }
             }
 

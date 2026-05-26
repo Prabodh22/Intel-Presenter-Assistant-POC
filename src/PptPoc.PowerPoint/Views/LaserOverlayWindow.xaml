@@ -1,0 +1,23 @@
+<Window x:Class="PptPoc.PowerPoint.Views.LaserOverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="LaserOverlayWindow" 
+        WindowStyle="None" 
+        AllowsTransparency="True" 
+        Background="Transparent" 
+        Topmost="True" 
+        ShowInTaskbar="False"
+        IsHitTestVisible="False">
+    <Canvas Name="OverlayCanvas">
+        <!-- The laser dot that we will animate -->
+        <Ellipse Name="LaserDot" 
+                 Width="16" Height="16" 
+                 Fill="#FFFF1111" 
+                 Visibility="Collapsed" 
+                 IsHitTestVisible="False">
+            <Ellipse.Effect>
+                <DropShadowEffect Color="#FFFF0000" BlurRadius="12" ShadowDepth="0" Opacity="1"/>
+            </Ellipse.Effect>
+        </Ellipse>
+    </Canvas>
+</Window>

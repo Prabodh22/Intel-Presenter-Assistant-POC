@@ -208,6 +208,11 @@ public class OrchestratorIntegrationTests
             return _slides.GetValueOrDefault(ReadCalls == 1 ? 1 : 2)
                 ?? new SlideSnapshot { SlideIndex = 1, SlideId = "default" };
         }
+
+        public Task<SlideSnapshot> ReadSlideFullAsync(object slideComObject)
+        {
+            return Task.FromResult(ReadSlide(slideComObject));
+        }
     }
 
     private sealed class FakeAudioCaptureService : IAudioCaptureService

@@ -101,10 +101,11 @@ public class KnowledgeBasePreprocessor
                 // Compute embedding from best available source
                 if (img.SemanticEmbedding == null && _semanticService.IsReady)
                 {
+                    string combinedOcrText = string.Join(" ", img.ExtractedWords.Select(w => w.Text));
                     string embedSource = !string.IsNullOrWhiteSpace(img.GptDescription)
                         ? img.GptDescription
-                        : !string.IsNullOrWhiteSpace(img.ExtractedOcrText)
-                            ? img.ExtractedOcrText
+                        : !string.IsNullOrWhiteSpace(combinedOcrText)
+                            ? combinedOcrText
                             : $"{img.AltText} {img.Title} {img.NearbyText}".Trim();
 
                     if (!string.IsNullOrWhiteSpace(embedSource))
@@ -119,7 +120,7 @@ public class KnowledgeBasePreprocessor
                     BBox = img.BoundingBox255,
                     Position = new[] { img.Left, img.Top, img.Width, img.Height },
                     ZOrder = img.ZOrder,
-                    OcrText = string.IsNullOrWhiteSpace(img.ExtractedOcrText) ? null : img.ExtractedOcrText,
+                    OcrWords = img.ExtractedWords.Count > 0 ? img.ExtractedWords : null,
                     AltText = string.IsNullOrWhiteSpace(img.AltText) ? null : img.AltText,
                     Title = string.IsNullOrWhiteSpace(img.Title) ? null : img.Title,
                     NearbyText = string.IsNullOrWhiteSpace(img.NearbyText) ? null : img.NearbyText,

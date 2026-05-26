@@ -61,8 +61,8 @@ public class ElementKB
     public int? ParagraphIndex { get; set; }
 
     // Image element fields
-    [YamlMember(Alias = "ocr_text")]
-    public string? OcrText { get; set; }
+    [YamlMember(Alias = "ocr_words")]
+    public List<OcrWordInfo>? OcrWords { get; set; }
 
     [YamlMember(Alias = "alt_text")]
     public string? AltText { get; set; }

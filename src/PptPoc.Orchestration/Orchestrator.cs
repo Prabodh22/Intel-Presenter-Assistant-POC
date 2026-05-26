@@ -39,6 +39,10 @@ public class Orchestrator : IOrchestrator
     // Transcript change detection
     private string _lastTranscriptText = string.Empty;
 
+    // Grace period: suppress highlights for N ms after a slide change
+    private DateTime _slideChangedAt = DateTime.MinValue;
+    private const int SlideChangeGraceMs = 1500;
+
     // Incremental ASR gate: only transcribe when enough new samples arrived.
     private long _samplesReceivedTotal;
     private long _lastTranscribedSampleTotal;
@@ -71,11 +75,14 @@ public class Orchestrator : IOrchestrator
         // Phase 1 Latency Optimization settings over-rides for real-time responsiveness
         _config.OrchestratorLoopMs = 50; 
         _config.AsrMinStepMs = 150;     // Transcribe as soon as 150ms of new audio is received
+        _config.TranscriptWindowSeconds = 5; // Shorter window so stale phrases expire faster
         
         // Phase 1 Fixes for Flickering
-        _config.HighlightDurationMs = 3000; // Keep highlights alive longer to prevent rapid flashing
-        _config.CooldownMs = 3000;          // Prevent re-highlighting the SAME element by matching the duration
+        _config.HighlightDurationMs = 2000; // Keep highlights alive but not too long
+        _config.CooldownMs = 1500;          // Faster re-highlighting for responsiveness
         _config.GlobalCooldownMs = 800;     // Prevent jumping between elements too rapidly
+        _config.MatchConfidenceThreshold = 0.4; // Raise threshold to reduce false positives
+        _config.StabilityRequiredCycles = 1;    // 1 cycle for text, *2=2 for images
         
         _pptService = pptService;
         _slideReader = slideReader;
@@ -239,8 +246,12 @@ public class Orchestrator : IOrchestrator
                         
                         _currentSnapshot = snapshot;
                         _lastSlideIndex = currentSlideIndex;
+                        _slideChangedAt = DateTime.UtcNow; // Start grace period
                         _transcriptProcessor.Clear(); // Clear old context
                         _debounce.Reset();            // Reset debounce state
+                        _lastTranscriptText = string.Empty;
+                        _samplesReceivedTotal = 0;
+                        _lastTranscribedSampleTotal = 0;
 
                         // Update ASR vocabulary hints with text from the new slide
                         var keywords = snapshot.TextElements.SelectMany(t => t.Words)
@@ -296,6 +307,10 @@ public class Orchestrator : IOrchestrator
                 if (string.IsNullOrWhiteSpace(transcriptText))
                     continue;
 
+                // 4b. Grace period after slide change — let ASR stabilize before matching
+                if ((DateTime.UtcNow - _slideChangedAt).TotalMilliseconds < SlideChangeGraceMs)
+                    continue;
+
                 // 5. Get current slide snapshot (refresh if slide changed)
                 var slideState = await RunOnUiAsync(() =>
                 {
@@ -329,12 +344,15 @@ public class Orchestrator : IOrchestrator
                 {
                     _lastSlideIndex  = slideState.SlideIndex;
                     _currentSnapshot = slideState.Snapshot;
+                    _slideChangedAt  = DateTime.UtcNow; // Start grace period
                     _debounce.Reset(); // Reset debounce on slide change
                     _transcriptProcessor.Clear(); // Clear stale transcript from previous slide
 
-                    // Push slide vocabulary into Whisper so domain terms are recognised.
+                    // Push slide vocabulary into ASR so domain terms are recognised.
+                    // Include raw text (preserves casing/acronyms), individual words, and keywords.
                     var keywords = _currentSnapshot.TextElements
                         .SelectMany(e => e.Words)
+                        .Concat(_currentSnapshot.TextElements.Select(e => e.RawText))
                         .Concat(_currentSnapshot.ImageElements.SelectMany(i => i.InferredKeywords))
                         .ToList();
                     _asrService.SetVocabularyHints(keywords);
@@ -389,7 +407,7 @@ public class Orchestrator : IOrchestrator
                 if (!highlightApplied)
                     continue;
 
-                _debounce.RecordHighlight(topMatch.Element.ElementId);
+                _debounce.RecordHighlight(topMatch.Element.ElementId, topMatch.Confidence);
 
                 HighlightApplied?.Invoke(
                     $"{topMatch.Type}: '{topMatch.MatchedPhrase}' → {topMatch.Element.ShapeName} ({topMatch.Confidence:P0})");

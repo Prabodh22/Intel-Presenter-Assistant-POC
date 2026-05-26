@@ -75,7 +75,7 @@ public class KnowledgeBaseLoader
                         Height = el.Position[3],
                         BoundingBox255 = el.BBox,
                         ZOrder = el.ZOrder,
-                        ExtractedOcrText = el.OcrText ?? string.Empty,
+                        ExtractedWords = el.OcrWords ?? new List<OcrWordInfo>(),
                         AltText = el.AltText ?? string.Empty,
                         Title = el.Title ?? string.Empty,
                         NearbyText = el.NearbyText ?? string.Empty,

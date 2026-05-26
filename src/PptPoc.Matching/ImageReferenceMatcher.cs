@@ -25,49 +25,60 @@ public static class ImageReferenceMatcher
 
     /// <summary>
     /// Scores how well the transcript text references a specific image element.
+    /// Returns the matched score, matched phrase, and optionally a specific OCR word 
+    /// if the match zeroed in on a sub-label inside the graph.
     /// </summary>
-    public static (double Score, string MatchedPhrase) Score(
+    public static (double Score, string MatchedPhrase, OcrWordInfo? TargetWord) Score(
         string transcriptText, float[]? transcriptEmbedding, ImageElement image, int imagePositionIndex, IReadOnlyList<ImageElement> allImages, ISemanticEmbeddingService semanticService)
     {
         if (string.IsNullOrWhiteSpace(transcriptText))
-            return (0.0, string.Empty);
+            return (0.0, string.Empty, null);
 
         var tNorm = TextNormalizer.Normalize(transcriptText);
         double bestScore = 0.0;
         string bestPhrase = string.Empty;
+        OcrWordInfo? bestWord = null;
 
-        // 1a. OCR text — highest priority source (1.2× boost) using Phase 2 semantics
-        if (!string.IsNullOrWhiteSpace(image.ExtractedOcrText))
+        // 1a. Semantic matching against the GPT-4o conceptual description
+        if (transcriptEmbedding != null && semanticService.IsReady && image.SemanticEmbedding != null)
         {
-            var (ocrScore, ocrPhrase) = FuzzyMatcher.Score(transcriptText, image.ExtractedOcrText);
-            
-            double semanticOcr = 0;
-            if (transcriptEmbedding != null && semanticService.IsReady)
+            double semanticOcr = semanticService.ComputeCosineSimilarity(transcriptEmbedding, image.SemanticEmbedding);
+            if (semanticOcr > bestScore)
             {
-                if (image.SemanticEmbedding == null)
-                {
-                    // Prioritize GPT-4o's rich context over raw OCR
-                    string embedSource = string.IsNullOrWhiteSpace(image.GptDescription) 
-                        ? image.ExtractedOcrText 
-                        : image.GptDescription;
-
-                    image.SemanticEmbedding = semanticService.GenerateEmbedding(embedSource);
-                }
-
-                semanticOcr = semanticService.ComputeCosineSimilarity(transcriptEmbedding, image.SemanticEmbedding);
-            }
-
-            double highestOcrMatch = Math.Max(ocrScore, semanticOcr);
-            double boosted = Math.Min(1.0, highestOcrMatch * 1.2);
-            
-            if (boosted > bestScore)
-            {
-                bestScore = boosted;
-                bestPhrase = semanticOcr > ocrScore ? transcriptText : ocrPhrase;
+                bestScore = semanticOcr;
+                bestPhrase = transcriptText;
+                bestWord = null; // Whole image
             }
         }
 
-        // 1b. Match against image alt text, title, nearby text, and keywords using Semantic Embeddings
+        // 1b. Exact/Fuzzy matching against specific OCR words within the image to get bounding box!
+        // Skip very short OCR words (single chars, numbers) that cause false positives.
+        if (image.ExtractedWords != null && image.ExtractedWords.Count > 0)
+        {
+            int ocrHitCount = 0;
+            foreach (var word in image.ExtractedWords)
+            {
+                if (word.Text.Length < 3) continue; // Skip noise: "1", "a", "%", etc.
+
+                var (wordScore, wordPhrase) = FuzzyMatcher.Score(transcriptText, word.Text);
+                if (wordScore > 0.7)
+                {
+                    ocrHitCount++;
+                    // Single OCR word matches are capped at 0.45 to avoid false positives.
+                    // Multiple hits or longer phrases score higher.
+                    double adjustedScore = ocrHitCount >= 2 ? wordScore * 1.1 : Math.Min(wordScore, 0.45);
+                    if (adjustedScore > 1.0) adjustedScore = 1.0;
+                    if (adjustedScore > bestScore)
+                    {
+                        bestScore = adjustedScore;
+                        bestPhrase = wordPhrase;
+                        bestWord = word;
+                    }
+                }
+            }
+        }
+
+        // 1c. Match against image alt text, title, nearby text, and keywords
         var candidateTexts = new List<string>();
         if (!string.IsNullOrWhiteSpace(image.AltText)) candidateTexts.Add(image.AltText);
         if (!string.IsNullOrWhiteSpace(image.Title)) candidateTexts.Add(image.Title);
@@ -85,16 +96,24 @@ public static class ImageReferenceMatcher
                 semanticCandidate = semanticService.ComputeCosineSimilarity(transcriptEmbedding, candidateEmbedding);
             }
 
-            double highestCandidateMatch = Math.Max(fuzzyScore, semanticCandidate);
+            // For short image metadata (few words), require fuzzy evidence — 
+            // semantic similarity alone is unreliable for short strings.
+            var candidateWordCount = candidate.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+            double highestCandidateMatch;
+            if (candidateWordCount <= 3 && fuzzyScore < 0.01)
+                highestCandidateMatch = 0.0; // Suppress semantic-only for short metadata
+            else
+                highestCandidateMatch = Math.Max(fuzzyScore, semanticCandidate);
             
             if (highestCandidateMatch > bestScore)
             {
                 bestScore = highestCandidateMatch;
                 bestPhrase = semanticCandidate > fuzzyScore ? transcriptText : phrase;
+                bestWord = null; // These apply to the whole image
             }
         }
 
-        // 2. Check for spatial reference phrases and perform coordinate bounding box math
+        // 2. Check for spatial reference phrases
         double spatialBoost = 0.0;
         
         bool isLeftmost = !allImages.Any(o => o.Left < image.Left);
@@ -106,7 +125,6 @@ public static class ImageReferenceMatcher
         {
             if (tNorm.Contains(sp))
             {
-                // Determine if it was a directional phrase
                 bool isDirectional = false;
                 bool directionMatched = false;
 
@@ -119,25 +137,25 @@ public static class ImageReferenceMatcher
                 {
                     if (directionMatched)
                     {
-                        spatialBoost = 0.9; // Massive boost for mathematical hit
+                        spatialBoost = 0.9;
                         if (string.IsNullOrEmpty(bestPhrase)) bestPhrase = sp;
                     }
                     else
                     {
-                        spatialBoost = -0.3; // Harsh penalty, this is objectively the wrong side!
+                        spatialBoost = -0.3;
                     }
                 }
                 else
                 {
-                    // Generic phrase like "this image", "on the screen"
-                    spatialBoost = 0.5; // Moderate boost to be validated by OCR/semantics
+                    // Generic spatial phrases alone should NOT be enough to trigger a highlight.
+                    // Only boost if there's already some content match.
+                    spatialBoost = bestScore > 0.2 ? 0.3 : 0.1;
                     if (string.IsNullOrEmpty(bestPhrase)) bestPhrase = sp;
                 }
-                break; // exit if spatial processed
+                break;
             }
         }
 
-        // 3. Ordinal matching: "the first image", "the second chart"
         if (allImages.Count > 1)
         {
             foreach (var (ordinalWord, ordinalIndex) in OrdinalMap)
@@ -154,13 +172,13 @@ public static class ImageReferenceMatcher
             }
         }
 
-        // If there's only one image on the slide and a spatial reference is detected,
-        if (allImages.Count == 1 && spatialBoost > 0 && bestScore < 0.8)
+        // 4. Fallback if single image — only if there's already a meaningful content match
+        if (allImages.Count == 1 && spatialBoost > 0 && bestScore > 0.3 && bestScore < 0.7)
         {
-            bestScore = 0.8;
+            bestScore = 0.7;
         }
 
         double finalScore = Math.Min(1.0, bestScore + spatialBoost);
-        return (finalScore, bestPhrase);
+        return (finalScore, bestPhrase, bestWord);
     }
 }

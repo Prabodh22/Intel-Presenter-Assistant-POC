@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices.WindowsRuntime;
 using PptPoc.Core.Interfaces;
+using PptPoc.Core.Models;
 using Serilog;
 using Windows.Globalization;
 using Windows.Graphics.Imaging;
@@ -45,10 +46,10 @@ public class WindowsOcrService : IOcrService
         });
     }
 
-    public async Task<string> ExtractTextAsync(byte[] imageData)
+    public async Task<List<OcrWordInfo>> ExtractTextAsync(byte[] imageData)
     {
         if (_engine == null || imageData.Length == 0)
-            return string.Empty;
+            return new List<OcrWordInfo>();
 
         try
         {
@@ -65,14 +66,14 @@ public class WindowsOcrService : IOcrService
         catch (Exception ex)
         {
             Log.Warning(ex, "OCR failed on in-memory image ({Bytes} bytes)", imageData.Length);
-            return string.Empty;
+            return new List<OcrWordInfo>();
         }
     }
 
-    public async Task<string> ExtractTextAsync(string imagePath)
+    public async Task<List<OcrWordInfo>> ExtractTextAsync(string imagePath)
     {
         if (_engine == null || !File.Exists(imagePath))
-            return string.Empty;
+            return new List<OcrWordInfo>();
 
         try
         {
@@ -82,16 +83,35 @@ public class WindowsOcrService : IOcrService
         catch (Exception ex)
         {
             Log.Warning(ex, "OCR failed on image file {Path}", imagePath);
-            return string.Empty;
+            return new List<OcrWordInfo>();
         }
     }
 
-    private async Task<string> RecognizeAsync(SoftwareBitmap bitmap)
+    private async Task<List<OcrWordInfo>> RecognizeAsync(SoftwareBitmap bitmap)
     {
         var result = await _engine!.RecognizeAsync(bitmap);
-        if (result.Lines.Count == 0) return string.Empty;
+        if (result.Lines.Count == 0) return new List<OcrWordInfo>();
 
-        return string.Join(" ", result.Lines.Select(l => l.Text));
+        double w = bitmap.PixelWidth;
+        double h = bitmap.PixelHeight;
+
+        var words = new List<OcrWordInfo>();
+        foreach (var line in result.Lines)
+        {
+            foreach (var word in line.Words)
+            {
+                words.Add(new OcrWordInfo
+                {
+                    Text = word.Text,
+                    // Store as relative percentages [0.0 - 1.0] for easy projection onto PPT points
+                    X = word.BoundingRect.X / w,
+                    Y = word.BoundingRect.Y / h,
+                    Width = word.BoundingRect.Width / w,
+                    Height = word.BoundingRect.Height / h
+                });
+            }
+        }
+        return words;
     }
 
     public void Dispose()

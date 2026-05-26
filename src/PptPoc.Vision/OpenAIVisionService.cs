@@ -49,7 +49,7 @@ public class OpenAIVisionService : IOpenAIVisionService
                     new
                     {
                         role = "system",
-                        content = "You are an AI analyzing presentation slides. You will receive a slide image and a text manifest mapping the native objects to a 0-255 grid coordinates [x1, y1, x2, y2]. Return a JSON object with an array 'elements', where each item has an 'id' matching the manifest id, and a 'rich_description' providing deep contextual and conceptual analysis of what the element represents combining both visual intent and surrounding text context."
+                        content = "You are an AI analyzing presentation slides. You will receive a slide image and a text manifest mapping the native objects to a 0-255 grid coordinates [x1, y1, x2, y2]. Return a JSON object with an array 'elements', where each item has an 'id' matching the manifest id, and a 'rich_description'. For text elements, extract the core semantic key takeaways and conceptual meaning. For image or chart elements, describe conceptually what the chart/image shows and its insights. This will be used for conceptual semantic similarity matching."
                     },
                     new
                     {

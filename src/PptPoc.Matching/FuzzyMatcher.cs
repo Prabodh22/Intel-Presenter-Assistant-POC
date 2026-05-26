@@ -35,9 +35,9 @@ public static class FuzzyMatcher
         if (tTokens.Count == 0 || eTokens.Count == 0)
             return (0.0, string.Empty);
 
-        // Content words: 4+ chars and not a noise word.
+        // Content words: 3+ chars and not a noise word.
         var eContent = eTokens
-            .Where(w => w.Length >= 4 && !NoiseWords.Contains(w))
+            .Where(w => w.Length >= 3 && !NoiseWords.Contains(w))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -95,8 +95,15 @@ public static class FuzzyMatcher
         }
         else
         {
-            // If an element is long, finding 3+ content words is a very strong signal.
-            coverage = matched.Count / 3.0; // 3 matches = 1.0
+            // If an element is long, finding 3+ content words is a strong signal.
+            // Base coverage caps at 1.0 when 3 words match.
+            // Depth bonus rewards additional matches (up to +0.15) to break ties
+            // between elements that share overlapping vocabulary.
+            double baseCoverage = Math.Min(matched.Count / 3.0, 1.0);
+            double depthBonus = matched.Count > 3
+                ? Math.Min((matched.Count - 3) * 0.03, 0.15)
+                : 0.0;
+            coverage = baseCoverage + depthBonus;
         }
 
         // Sequence bonus: any 2+ adjacent content words appear consecutively in transcript.
@@ -107,7 +114,7 @@ public static class FuzzyMatcher
             seqBonus *= 0.2; // Scale down for dense/long transcripts
         }
 
-        double score = Math.Min(1.0, coverage + seqBonus);
+        double score = Math.Min(1.15, coverage + seqBonus); // Allow up to 1.15 for depth tiebreaking
         string phrase = string.Join(" ", matched.Take(6));
 
         return (score, phrase);

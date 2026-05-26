@@ -50,7 +50,7 @@ public class MatchingTests
             AltText = "chip package diagram"
         };
 
-        var (score, phrase) = ImageReferenceMatcher.Score(
+        var (score, phrase, targetWord) = ImageReferenceMatcher.Score(
             "the first image shows the package layout",
             null,
             image,
@@ -128,8 +128,8 @@ public class MatchingTests
 
         debounce.RecordHighlight("elem-1");
 
-        // Same element should be allowed to refresh
-        Assert.True(debounce.ShouldHighlight("elem-1", 0.9, PptPoc.Core.Models.MatchType.TextMatch));
+        // Same element should NOT be allowed to refresh during cooldown to avoid laser spam
+        Assert.False(debounce.ShouldHighlight("elem-1", 0.9, PptPoc.Core.Models.MatchType.TextMatch));
         
         // Different element should be blocked by global/element cooldown
         Assert.False(debounce.ShouldHighlight("elem-2", 0.9, PptPoc.Core.Models.MatchType.TextMatch));

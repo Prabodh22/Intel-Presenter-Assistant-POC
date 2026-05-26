@@ -52,7 +52,8 @@ public partial class MainWindow : Window
 
         var transcriptProcessor = new TranscriptProcessor(_config);
         var matcherEngine = new MatcherEngine(_config, _semanticService);
-        var renderer = new EditModeRenderer(_config);
+        var renderer = new SlideshowLaserRenderer(_config);
+        renderer.EnsureOverlay();
         var debounce = new DebounceManager(_config);
 
         _orchestrator = new Orchestrator(
@@ -323,6 +324,14 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task EnsureKnowledgeBaseAsync()
     {
+        // Skip if a KB was already loaded manually via the Load KB button
+        if (_kbLoader.IsLoaded)
+        {
+            Log.Information("KB already loaded ({Name}, {Count} slides), skipping auto-preprocess",
+                _kbLoader.PresentationName, _kbLoader.SlideCount);
+            return;
+        }
+
         if (!_pptService.TryAttach()) return;
 
         var presObj = _pptService.GetActivePresentationComObject();

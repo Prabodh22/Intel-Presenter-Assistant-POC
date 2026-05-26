@@ -24,7 +24,7 @@ public class TextElement : SlideElement
 
 public class ImageElement : SlideElement
 {
-    public string ExtractedOcrText { get; set; } = string.Empty;
+    public List<OcrWordInfo> ExtractedWords { get; set; } = new();
     public string AltText { get; set; } = string.Empty;
     public string ProximityText { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
