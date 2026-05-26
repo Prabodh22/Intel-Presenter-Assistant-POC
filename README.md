@@ -1,34 +1,283 @@
-# PPT text/Image highlight[POC]
+# 🎯 PPT Speaker Highlight — Real-Time Voice-Driven Slide Highlighting
 
-## Overview
-This Proof of Concept (POC) is a real-time local C# application that listens to a presenter using an offline transcription model and dynamically highlights corresponding PowerPoint slide elements (both text and structural images) as they speak.
+<p align="center">
+  <img src="https://img.shields.io/badge/.NET-8.0-512BD4?logo=dotnet" alt=".NET 8"/>
+  <img src="https://img.shields.io/badge/WPF-Desktop-0078D4?logo=windows" alt="WPF"/>
+  <img src="https://img.shields.io/badge/OpenVINO-Parakeet_ASR-0071C5?logo=intel" alt="OpenVINO"/>
+  <img src="https://img.shields.io/badge/ONNX-MiniLM_Embeddings-FF6F00" alt="ONNX"/>
+  <img src="https://img.shields.io/badge/Office-COM_Interop-D83B01?logo=microsoftoffice" alt="Office"/>
+</p>
 
-## Setup & Run Instructions
-1. Ensure the **.NET 8.0 SDK** (and optionally .NET 10.0 for tests) is installed.
-2. Ensure **Microsoft PowerPoint** is installed (the app uses Office COM Interop).
-3. Build the solution or just run the application from the root:
-   ```bash
-   dotnet run --project .\src\PptPoc.App\PptPoc.App.csproj
-   ```
+> A proof-of-concept desktop application that **listens to a presenter speaking** and **highlights the corresponding PowerPoint slide element in real-time** — text bullets, chart labels, tables, or images — using fully local AI models (no cloud dependencies).
 
-## First-Launch Expectations
-- **Model Downloads:** The application requires OpenVINO Parakeet for audio transcription (ASR) and the `all-MiniLM-L6-v2` ONNX model for text embeddings. On the very first launch, the app will automatically download these to the local `models/` directory. System proxy settings are detected and applied automatically.
-- **Cold Start:** Expect the very first startup to take roughly 10-15 seconds as it compiles the OpenVINO caches (`CACHE_DIR`).
+---
 
-## Implementation Flow & Logic (Phases 1-3)
+## ⚡ High-Level Architecture
 
-### Phase 1: Core & Logic
-- **Audio & ASR:** Implemented continuous audio capture using NAudio. Integrated OpenVINO Parakeet ASR module. To accommodate the ASR's stateless encoder, heavily relied on a 3-second overlapping sliding window to prevent missing/chopped words.
-- **PowerPoint Interop:** Integrated initial Office COM interop to parse open PPT slides, extract Shapes by Z-Order, map Paragraph bounds, and render baseline translucent yellow borders over corresponding elements.
+```mermaid
+graph LR
+    subgraph Input
+        MIC[🎤 Microphone]
+    end
 
-### Phase 2: Semantic Matching
-- **Embeddings:** Shifted away from simple string/Levenshtein matching by incorporating an offline Semantic Search engine.
-- **Scoring Pipeline:** Uses Cosine Similarity against `all-MiniLM-L6-v2` embeddings, blended with fallback Fuzzy Match bounds for the optimal Confidence Score.
-- **Image Context:** Leveraged Windows native OCR tasks asynchronously to extract hidden text from diagrams, falling back on Alt Text and Proximity text to build semantic meaning for `ImageElements`.
+    subgraph Processing
+        ASR[Parakeet ASR<br/><i>Speech → Text</i>]
+        MATCH[Matcher Engine<br/><i>Fuzzy + Semantic</i>]
+    end
 
-### Phase 3: True Real-Time & Streaming
-- **Debounce & Stabilization:** Built `DebounceManager.cs` to manage global and element-specific cooldowns to kill UI flickering.
-- **Granular Heuristics:**
-  - Added *Title Bias Penalties* so the model accurately prefers dense descriptive bullet blocks instead of artificially clamping to short slide titles.
-  - Eliminated noise triggers ensuring short NLP stop-words ("the", "in") did not artificially trigger 1.0 confidence against short Alt-Text fallbacks.
-  - Designed lean **Spatial Bounding Box Math Heuristics** allowing the app to instinctively understand "the image on the left" by mapping mathematically lowest bounding anchors (`Left`, `Top`) among current slide objects without needing the heavy 4GB overhead of a VLM.
+    subgraph Knowledge
+        KB[Knowledge Base<br/><i>Pre-computed YAML</i>]
+        EMB[MiniLM Embeddings<br/><i>384-dim vectors</i>]
+    end
+
+    subgraph Output
+        PPT[PowerPoint<br/><i>Laser Highlight</i>]
+    end
+
+    MIC -->|16kHz PCM| ASR
+    ASR -->|Transcript window| MATCH
+    KB --> MATCH
+    EMB --> MATCH
+    MATCH -->|Best element + confidence| PPT
+```
+
+---
+
+## 🎬 How It Works
+
+1. **Listen** — Captures microphone audio in real-time (16kHz, mono)
+2. **Transcribe** — Local Parakeet ASR converts speech to text every ~150ms
+3. **Match** — Fuzzy + semantic scoring finds the best matching slide element
+4. **Highlight** — Draws a laser-pointer overlay on the winning element in PowerPoint
+
+The entire pipeline runs **locally on-device** with ~200ms end-to-end latency.
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- Microsoft PowerPoint (Office COM Interop)
+- Windows 10/11 (x64)
+
+### Run
+```powershell
+dotnet run --project .\src\PptPoc.App\PptPoc.App.csproj
+```
+
+### First Launch
+| Step | What happens | Time |
+|------|-------------|------|
+| 1 | Downloads Parakeet ASR model (~200MB) | ~30s |
+| 2 | Downloads MiniLM embedding model (~23MB) | ~5s |
+| 3 | Compiles OpenVINO inference cache | ~10s |
+| 4 | App ready — open a `.pptx` and start presenting | — |
+
+> Subsequent launches skip downloads and use the compiled cache (~2s startup).
+
+---
+
+## 📦 Project Structure
+
+```
+PPT-text-Image-highlight-POC/
+├── src/
+│   ├── PptPoc.App/              # WPF host, UI, configuration
+│   ├── PptPoc.Audio/            # NAudio microphone capture (16kHz PCM)
+│   ├── PptPoc.Asr/             # OpenVINO Parakeet speech-to-text
+│   ├── PptPoc.Core/            # Shared models, interfaces, config
+│   ├── PptPoc.Matching/        # FuzzyMatcher, SemanticEmbedding, ConfidenceScorer
+│   ├── PptPoc.Orchestration/   # Main loop, KB preprocessor/loader
+│   ├── PptPoc.PowerPoint/      # COM Interop, shape extraction, laser renderer
+│   └── PptPoc.Vision/          # Windows OCR, OpenAI Vision (optional)
+├── tests/
+│   ├── PptPoc.Matching.Tests/
+│   └── PptPoc.Orchestration.Tests/
+├── models/                      # Auto-downloaded AI models
+│   ├── minilm/                  # all-MiniLM-L6-v2 (ONNX, quantized)
+│   └── parakeet/               # OpenVINO Parakeet ASR
+└── logs/                        # Serilog output (debug + info)
+```
+
+---
+
+## 🧠 Implementation Phases
+
+### Phase 1 — Core Pipeline
+- **Audio Capture:** Continuous 16kHz PCM via NAudio with configurable buffer sizes
+- **ASR Engine:** OpenVINO Parakeet with 3-second overlapping sliding window to prevent word chopping across stateless encoder boundaries
+- **PowerPoint Interop:** COM-based shape extraction (Z-order, paragraphs, tables, charts), translucent laser overlay rendering
+
+### Phase 2 — Semantic Intelligence
+- **Embeddings:** `all-MiniLM-L6-v2` ONNX model generates 384-dim vectors for all slide text at preprocessing time
+- **Dual Scoring:** Cosine similarity (semantic) blended with fuzzy coverage (lexical) — best of both worlds
+- **Image Understanding:** Windows OCR extracts text from diagrams/charts; alt-text and proximity text provide additional semantic context
+- **Chart/Table Extraction:** COM API access to chart SeriesCollection, category names, and table cell content
+
+### Phase 3 — Real-Time UX Polish
+- **Debounce & Stabilization:** Global + per-element cooldowns, sliding-window vote stability filter
+- **Stickiness:** Prevents oscillation between elements with similar scores — requires a confidence margin to switch
+- **Depth Tiebreaking:** Elements matching more transcript words score proportionally higher (+0.03/word beyond 3, up to +0.15)
+- **False Positive Guards:**
+  - Short text elements (≤2 words) require fuzzy evidence, not just semantic similarity
+  - Single OCR word image matches capped at 0.45 (prevents "accuracy" → image highlight)
+  - Title penalty (-0.15) favors denser content elements
+- **Spatial Reasoning:** Bounding-box math resolves "the image on the left/right" without a vision model
+
+### Phase 4 — Knowledge Base Preprocessing
+- **Offline Preprocessing:** Slides are analyzed once; embeddings, OCR, and metadata cached to YAML
+- **Instant Runtime:** No COM/OCR/GPT needed during presentation — pure matching against pre-computed KB
+- **Vocabulary Hints:** KB-derived word lists improve ASR accuracy via transcript correction
+
+---
+
+## ⚙️ Configuration
+
+Key tuning parameters (set in `Orchestrator.cs`):
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `TranscriptWindowSeconds` | 5 | Rolling speech window for matching |
+| `HighlightDurationMs` | 2000 | How long laser stays visible |
+| `CooldownMs` | 1500 | Per-element re-highlight cooldown |
+| `GlobalCooldownMs` | 800 | Min gap between any two highlights |
+| `MatchConfidenceThreshold` | 0.4 | Minimum score to trigger highlight |
+| `StabilityRequiredCycles` | 1 | Votes needed (×2 for images) |
+
+---
+
+## 🧪 Testing
+
+```powershell
+# Unit tests (matching logic)
+dotnet test tests\PptPoc.Matching.Tests
+
+# Integration tests (orchestrator)
+dotnet test tests\PptPoc.Orchestration.Tests
+```
+
+---
+
+## 🏗️ Detailed Architecture
+
+```mermaid
+flowchart TB
+    subgraph UI ["🖥️ PptPoc.App (WPF)"]
+        MW[MainWindow]
+        CFG[AppConfig]
+    end
+
+    subgraph Audio ["🎤 PptPoc.Audio"]
+        MIC[MicrophoneCaptureService<br/><i>NAudio 16kHz mono</i>]
+    end
+
+    subgraph ASR ["🗣️ PptPoc.Asr"]
+        PAR[ParakeetAsrService<br/><i>OpenVINO inference</i>]
+        TP[TranscriptProcessor<br/><i>Sliding window</i>]
+    end
+
+    subgraph Orchestration ["🎛️ PptPoc.Orchestration"]
+        ORC[Orchestrator<br/><i>Main processing loop</i>]
+        KBL[KnowledgeBaseLoader<br/><i>YAML → SlideSnapshot</i>]
+        KBP[KnowledgeBasePreprocessor<br/><i>Slides → YAML KB</i>]
+    end
+
+    subgraph Matching ["🎯 PptPoc.Matching"]
+        ME[MatcherEngine]
+        FM[FuzzyMatcher<br/><i>Coverage + prefix + Levenshtein</i>]
+        SEM[SemanticEmbeddingService<br/><i>MiniLM ONNX</i>]
+        IRM[ImageReferenceMatcher<br/><i>OCR + spatial + keywords</i>]
+        CS[ConfidenceScorer<br/><i>Penalties + depth bonus</i>]
+        DM[DebounceManager<br/><i>Cooldown + stickiness</i>]
+        TVC[TranscriptVocabularyCorrector]
+    end
+
+    subgraph PowerPoint ["📊 PptPoc.PowerPoint"]
+        PPT[PowerPointService<br/><i>COM Interop</i>]
+        SR[SlideReader<br/><i>Shapes, tables, charts</i>]
+        LR[SlideshowLaserRenderer<br/><i>WPF overlay</i>]
+    end
+
+    subgraph Vision ["👁️ PptPoc.Vision"]
+        OCR[WindowsOcrService<br/><i>Windows.Media.Ocr</i>]
+        GPT[OpenAIVisionService<br/><i>GPT-4o descriptions</i>]
+    end
+
+    subgraph Storage ["💾 Storage"]
+        KB[(knowledge_base.yaml<br/><i>Pre-computed KB</i>)]
+        MDL[(models/<br/><i>ONNX + OpenVINO</i>)]
+    end
+
+    %% Data flow
+    MW --> ORC
+    MIC -->|PCM buffer| ORC
+    ORC -->|audio samples| PAR
+    PAR -->|text| TP
+    TP -->|transcript window| ORC
+    ORC -->|transcript + snapshot| ME
+
+    ME --> FM
+    ME --> SEM
+    ME --> IRM
+    ME --> CS
+    IRM --> FM
+    IRM --> SEM
+
+    ORC --> DM
+    ORC --> TVC
+    ORC -->|highlight request| LR
+    LR -->|laser overlay| PPT
+
+    KBP --> SR
+    KBP --> OCR
+    KBP --> GPT
+    KBP --> SEM
+    KBP -->|serialize| KB
+
+    KBL -->|deserialize| KB
+    KBL -->|SlideSnapshot| ORC
+
+    SEM --> MDL
+    PAR --> MDL
+
+    classDef processing fill:#e1f5fe,stroke:#0288d1
+    classDef matching fill:#f3e5f5,stroke:#7b1fa2
+    classDef io fill:#e8f5e9,stroke:#388e3c
+    classDef storage fill:#fff3e0,stroke:#f57c00
+
+    class PAR,TP processing
+    class ME,FM,SEM,IRM,CS,DM matching
+    class MIC,PPT,LR io
+    class KB,MDL storage
+```
+
+---
+
+## 📊 Scoring Pipeline Detail
+
+```mermaid
+flowchart LR
+    T[Transcript Window] --> FM[FuzzyMatcher]
+    T --> SEM[Semantic Cosine]
+    
+    FM -->|coverage + depth| MAX{Math.Max}
+    SEM -->|similarity| MAX
+    
+    MAX -->|raw score| CS[ConfidenceScorer]
+    
+    CS -->|"-0.10 short elem<br/>-0.10 ImageMatch<br/>-0.15 Title"| CONF[Final Confidence]
+    
+    CONF --> THR{"> 0.4?"}
+    THR -->|Yes| DM[DebounceManager]
+    THR -->|No| DROP[Drop]
+    
+    DM -->|"Stickiness OK?<br/>Cooldown expired?"| HL[✨ Highlight]
+    DM -->|Blocked| SKIP[Skip]
+```
+
+---
+
+## 📝 License
+
+Internal POC — not for redistribution.
