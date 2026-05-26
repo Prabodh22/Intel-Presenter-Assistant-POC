@@ -16,27 +16,33 @@
 
 ```mermaid
 graph LR
-    subgraph Input
-        MIC[🎤 Microphone]
+    subgraph Input ["🎧 Audio Input"]
+        MIC["🎤 🎧 🎙️"]
     end
 
-    subgraph Processing
+    subgraph ASR_Block ["🗣️ Transcription"]
         ASR[Parakeet ASR<br/><i>Speech → Text</i>]
+    end
+
+    subgraph Logic ["🧠 Logic"]
         MATCH[Matcher Engine<br/><i>Fuzzy + Semantic</i>]
     end
 
-    subgraph Knowledge
-        KB[Knowledge Base<br/><i>Pre-computed YAML</i>]
+    subgraph Knowledge ["📚 Knowledge Base"]
+        direction TB
+        TXT[📝 Text Pipeline<br/><i>Paragraphs · Tables · Charts</i>]
+        IMG[🖼️ Image Pipeline<br/><i>OCR · GPT-4o Vision</i>]
         EMB[MiniLM Embeddings<br/><i>384-dim vectors</i>]
     end
 
-    subgraph Output
+    subgraph Output ["📊 Output"]
         PPT[PowerPoint<br/><i>Laser Highlight</i>]
     end
 
     MIC -->|16kHz PCM| ASR
     ASR -->|Transcript window| MATCH
-    KB --> MATCH
+    TXT --> EMB
+    IMG --> EMB
     EMB --> MATCH
     MATCH -->|Best element + confidence| PPT
 ```
