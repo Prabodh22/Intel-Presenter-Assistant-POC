@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Windows.Threading;
 using PptPoc.Core.Configuration;
 using PptPoc.Core.Interfaces;
@@ -26,6 +27,26 @@ public class SlideshowLaserRenderer : IHighlightRenderer
     private readonly ConcurrentDictionary<string, string> _active = new();
     private LaserOverlayWindow? _overlay;
     private Dispatcher? _dispatcher;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    private const uint MONITOR_DEFAULTTONEAREST = 2;
 
     public SlideshowLaserRenderer(AppConfig config)
     {
@@ -68,9 +89,45 @@ public class SlideshowLaserRenderer : IHighlightRenderer
                 float slideW = app.ActivePresentation.PageSetup.SlideWidth;
                 float slideH = app.ActivePresentation.PageSetup.SlideHeight;
 
+                double hostLeft = 0;
+                double hostTop = 0;
+                double hostWidth = System.Windows.SystemParameters.PrimaryScreenWidth;
+                double hostHeight = System.Windows.SystemParameters.PrimaryScreenHeight;
+                double dpiScale = 1.0;
+
+                // Anchor overlay to the actual slideshow window monitor (external display safe)
+                try
+                {
+                    var slideShowWindow = app.SlideShowWindows[1];
+                    IntPtr hwnd = new IntPtr(slideShowWindow.HWND);
+                    if (hwnd != IntPtr.Zero && GetWindowRect(hwnd, out RECT rect))
+                    {
+                        // GetWindowRect returns physical pixels; WPF needs DIPs.
+                        // Determine the DPI of the monitor the slideshow is on.
+                        try
+                        {
+                            IntPtr hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                            if (hMon != IntPtr.Zero && GetDpiForMonitor(hMon, 0, out uint dpiX, out _) == 0)
+                                dpiScale = dpiX / 96.0;
+                        }
+                        catch { /* pre-Win8.1 fallback: keep dpiScale=1 */ }
+
+                        hostLeft   = rect.Left   / dpiScale;
+                        hostTop    = rect.Top    / dpiScale;
+                        hostWidth  = Math.Max(1, (rect.Right - rect.Left) / dpiScale);
+                        hostHeight = Math.Max(1, (rect.Bottom - rect.Top) / dpiScale);
+                    }
+                }
+                catch
+                {
+                    // Fallback to primary screen metrics if slideshow window bounds are unavailable.
+                }
+
+                _overlay.SetOverlayBounds(hostLeft, hostTop, hostWidth, hostHeight);
+
                 // Compute aspect-ratio-aware render area
-                double scrW = System.Windows.SystemParameters.PrimaryScreenWidth;
-                double scrH = System.Windows.SystemParameters.PrimaryScreenHeight;
+                double scrW = hostWidth;
+                double scrH = hostHeight;
                 double slideAspect = slideW / slideH;
                 double screenAspect = scrW / scrH;
                 double renderW, renderH, offX, offY;
@@ -79,6 +136,14 @@ public class SlideshowLaserRenderer : IHighlightRenderer
                 { renderW = scrW; renderH = scrW / slideAspect; offX = 0; offY = (scrH - renderH) / 2; }
                 else
                 { renderH = scrH; renderW = scrH * slideAspect; offX = (scrW - renderW) / 2; offY = 0; }
+
+                Log.Information("Slideshow laser: element='{Shape}' L={EL:F0} T={ET:F0} W={EW:F0} H={EH:F0} | " +
+                    "slideW={SW:F0} slideH={SH:F0} | host={HL:F0},{HT:F0} {HW:F0}x{HH:F0} | " +
+                    "render={RW:F0}x{RH:F0} off={OX:F0},{OY:F0} | dpi={DPI:F2}",
+                    request.Element.ShapeName,
+                    request.Element.Left, request.Element.Top, request.Element.Width, request.Element.Height,
+                    slideW, slideH, hostLeft, hostTop, hostWidth, hostHeight,
+                    renderW, renderH, offX, offY, dpiScale);
 
                 _overlay.AnimateLaserHighlight(
                     request.Element, slideW, slideH,
@@ -105,33 +170,18 @@ public class SlideshowLaserRenderer : IHighlightRenderer
     /// </summary>
     private static void DrawScribbleShape(Ppt.Slide slide, SlideElement element)
     {
-        float cx = element.Left + element.Width / 2;
-        float cy = element.Top + element.Height / 2;
-        float pad = 10f;
-        float rx = element.Width / 2 + pad;
-        float ry = element.Height / 2 + pad;
-
-        const double orbits = 1.5;
-        const int totalPoints = 72;
-        double totalAngle = orbits * 2 * Math.PI;
-        double startAngle = -Math.PI / 2;
-
-        float startX = cx + rx * (float)Math.Cos(startAngle);
-        float startY = cy + ry * (float)Math.Sin(startAngle);
+        // Horizontal underline just below the element
+        float pad = 5f;
+        float lineY = element.Top + element.Height + pad;
+        float lineLeft = element.Left - pad;
+        float lineRight = element.Left + element.Width + pad;
 
         var builder = slide.Shapes.BuildFreeform(
-            Office.MsoEditingType.msoEditingAuto, startX, startY);
+            Office.MsoEditingType.msoEditingAuto, lineLeft, lineY);
 
-        for (int i = 1; i <= totalPoints; i++)
-        {
-            double angle = startAngle + totalAngle * i / totalPoints;
-            float px = cx + rx * (float)Math.Cos(angle);
-            float py = cy + ry * (float)Math.Sin(angle);
-            builder.AddNodes(
-                Office.MsoSegmentType.msoSegmentLine,
-                Office.MsoEditingType.msoEditingAuto,
-                px, py);
-        }
+        // Single horizontal line
+        builder.AddNodes(Office.MsoSegmentType.msoSegmentLine,
+            Office.MsoEditingType.msoEditingAuto, lineRight, lineY);
 
         var scribble = builder.ConvertToShape();
         scribble.Fill.Visible = Office.MsoTriState.msoFalse;

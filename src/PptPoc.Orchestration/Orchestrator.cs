@@ -79,10 +79,10 @@ public class Orchestrator : IOrchestrator
         
         // Phase 1 Fixes for Flickering
         _config.HighlightDurationMs = 2000; // Keep highlights alive but not too long
-        _config.CooldownMs = 1500;          // Faster re-highlighting for responsiveness
-        _config.GlobalCooldownMs = 800;     // Prevent jumping between elements too rapidly
+        _config.CooldownMs = 800;           // Faster re-highlighting for responsiveness
+        _config.GlobalCooldownMs = 300;     // Prevent jumping between elements too rapidly
         _config.MatchConfidenceThreshold = 0.4; // Raise threshold to reduce false positives
-        _config.StabilityRequiredCycles = 1;    // 1 cycle for text, *2=2 for images
+        _config.StabilityRequiredCycles = 1;    // 1 cycle for both text and images
         
         _pptService = pptService;
         _slideReader = slideReader;
@@ -296,11 +296,17 @@ public class Orchestrator : IOrchestrator
                 var transcriptText = _transcriptProcessor.GetRecentTranscriptText(
                     TimeSpan.FromSeconds(_config.TranscriptWindowSeconds));
 
+                var displayTranscriptText = _transcriptProcessor.GetRecentTranscriptTextForDisplay(
+                    TimeSpan.FromSeconds(_config.TranscriptWindowSeconds));
+
                 // Notify UI of transcript update
-                if (!string.IsNullOrWhiteSpace(transcriptText) && transcriptText != _lastTranscriptText)
+                if (!string.IsNullOrWhiteSpace(displayTranscriptText) && displayTranscriptText != _lastTranscriptText)
                 {
-                    _lastTranscriptText = transcriptText;
-                    TranscriptUpdated?.Invoke(transcriptText);
+                    _lastTranscriptText = displayTranscriptText;
+                    TranscriptUpdated?.Invoke(displayTranscriptText);
+                    Log.Debug("Transcript UI='{Display}' | Raw='{Raw}'",
+                        displayTranscriptText,
+                        transcriptText);
                 }
 
                 // 4. Check for meaningful change — skip if no new words

@@ -82,7 +82,12 @@ public class MatcherEngine : IMatcherEngine
         {
             var imgElem = snapshot.ImageElements[i];
             var (score, phrase, targetWord) = ImageReferenceMatcher.Score(transcriptText, transcriptEmbedding, imgElem, i, snapshot.ImageElements, _semanticService);
-            double confidence = _scorer.ComputeConfidence(score, MatchType.ImageMatch, imgElem);
+            var (numericBoost, numericPhrase) = NumericChartMatcher.Score(transcriptText, imgElem);
+            double combinedImageScore = Math.Min(1.0, score + numericBoost);
+            if (numericBoost > 0 && !string.IsNullOrWhiteSpace(numericPhrase))
+                phrase = string.IsNullOrWhiteSpace(phrase) ? numericPhrase : $"{phrase}; {numericPhrase}";
+
+            double confidence = _scorer.ComputeConfidence(combinedImageScore, MatchType.ImageMatch, imgElem);
 
             if (_scorer.MeetsThreshold(confidence))
             {
@@ -112,8 +117,39 @@ public class MatcherEngine : IMatcherEngine
             }
         }
 
-        // Sort by confidence descending — only the top result will be used
-        results.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
+        // Sort by confidence descending; at equal confidence, prefer text over image (less disruptive)
+        results.Sort((a, b) =>
+        {
+            int cmp = b.Confidence.CompareTo(a.Confidence);
+            if (cmp != 0) return cmp;
+            if (a.Type == MatchType.TextMatch && b.Type == MatchType.ImageMatch) return -1;
+            if (a.Type == MatchType.ImageMatch && b.Type == MatchType.TextMatch) return 1;
+            return 0;
+        });
+
+        // For sentence-like speech, avoid abrupt switches to image highlights when a text candidate is close.
+        // This keeps highlight focus on spoken sentence flow unless image evidence is clearly stronger.
+        const int sentenceWordThreshold = 5;
+        const double imageOverTextMargin = 0.12;
+        int transcriptWordCount = transcriptText
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Length;
+
+        if (results.Count > 1 &&
+            transcriptWordCount >= sentenceWordThreshold &&
+            results[0].Type == MatchType.ImageMatch)
+        {
+            var bestText = results.FirstOrDefault(r => r.Type == MatchType.TextMatch);
+            if (bestText != null && bestText.Confidence >= results[0].Confidence - imageOverTextMargin)
+            {
+                results.Remove(bestText);
+                results.Insert(0, bestText);
+                Log.Debug(
+                    "Text preference override applied for sentence transcript. Image={ImageConfidence:F2}, Text={TextConfidence:F2}",
+                    results[1].Confidence,
+                    bestText.Confidence);
+            }
+        }
 
         if (results.Count > 0)
         {

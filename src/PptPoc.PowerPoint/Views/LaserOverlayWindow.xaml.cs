@@ -40,11 +40,22 @@ public partial class LaserOverlayWindow : Window
         int extendedStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
         SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle | WS_EX_TRANSPARENT);
 
-        // Make window cover the primary screen
-        Left = 0;
-        Top = 0;
-        Width = SystemParameters.PrimaryScreenWidth;
-        Height = SystemParameters.PrimaryScreenHeight;
+        // Default to virtual desktop; renderer can override to active slideshow screen.
+        Left = SystemParameters.VirtualScreenLeft;
+        Top = SystemParameters.VirtualScreenTop;
+        Width = SystemParameters.VirtualScreenWidth;
+        Height = SystemParameters.VirtualScreenHeight;
+    }
+
+    public void SetOverlayBounds(double left, double top, double width, double height)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            Left = left;
+            Top = top;
+            Width = Math.Max(1, width);
+            Height = Math.Max(1, height);
+        });
     }
 
     /// <summary>
@@ -61,72 +72,35 @@ public partial class LaserOverlayWindow : Window
                 _animCts = new CancellationTokenSource();
                 var ct = _animCts.Token;
 
-                // Center of element in PPT points
-                double cx = element.Left + element.Width / 2;
-                double cy = element.Top + element.Height / 2;
+                // Static attention dot at the center of the element.
+                double dotX = element.Left + (element.Width / 2.0);
+                double dotY = element.Top + (element.Height / 2.0);
 
-                // Radius of orbit in PPT points (add padding)
-                double rx = element.Width / 2 + 10;
-                double ry = element.Height / 2 + 10;
+                // Map PPT points to screen pixels
+                double screenX = offsetX + dotX / slideWidthPoints * presentationScreenW;
+                double screenY = offsetY + dotY / slideHeightPoints * presentationScreenH;
 
+                // Convert absolute screen coordinates to overlay-canvas coordinates
+                double canvasX = screenX - Left - LaserDot.Width / 2;
+                double canvasY = screenY - Top - LaserDot.Height / 2;
+
+                // Position dot and make visible
+                Canvas.SetLeft(LaserDot, canvasX);
+                Canvas.SetTop(LaserDot, canvasY);
                 LaserDot.Visibility = Visibility.Visible;
+                LaserDot.RenderTransform = null;
+                LaserDot.BeginAnimation(Canvas.LeftProperty, null);
+                LaserDot.BeginAnimation(Canvas.TopProperty, null);
 
-                // Create a PathGeometry for the animation
-                var path = new System.Windows.Media.PathGeometry();
-                var figure = new System.Windows.Media.PathFigure();
-                
-                // Start angle at top (-90 degrees)
-                double startPx = offsetX + (cx + rx * Math.Cos(-Math.PI / 2)) / slideWidthPoints * presentationScreenW;
-                double startPy = offsetY + (cy + ry * Math.Sin(-Math.PI / 2)) / slideHeightPoints * presentationScreenH;
-                figure.StartPoint = new Point(startPx, startPy);
-
-                // Build a polyline roughly approximating 1.5 orbits
-                var poly = new System.Windows.Media.PolyLineSegment();
-                
-                double orbits = 1.5;
-                int segments = 60;
-                for (int i = 1; i <= segments * orbits; i++)
-                {
-                    double angle = -Math.PI / 2 + (i * Math.PI * 2 / segments);
-                    double px = offsetX + (cx + rx * Math.Cos(angle)) / slideWidthPoints * presentationScreenW;
-                    double py = offsetY + (cy + ry * Math.Sin(angle)) / slideHeightPoints * presentationScreenH;
-                    poly.Points.Add(new Point(px, py));
-                }
-                
-                figure.Segments.Add(poly);
-                path.Figures.Add(figure);
-
-                // Set up animation
-                var animX = new DoubleAnimationUsingPath
-                {
-                    PathGeometry = path,
-                    Source = PathAnimationSource.X,
-                    Duration = TimeSpan.FromMilliseconds(1500)
-                };
-                var animY = new DoubleAnimationUsingPath
-                {
-                    PathGeometry = path,
-                    Source = PathAnimationSource.Y,
-                    Duration = TimeSpan.FromMilliseconds(1500)
-                };
-
-                // Center the ellipse on the path points
-                animX.FillBehavior = FillBehavior.HoldEnd;
-                animY.FillBehavior = FillBehavior.HoldEnd;
-
-                // Offset the path by the ellipse radius to actually center it
-                var tf = new System.Windows.Media.TranslateTransform(-LaserDot.Width/2, -LaserDot.Height/2);
-                LaserDot.RenderTransform = tf;
-
-                // Apply animations directly to avoid Storyboard NameScope issues
-                LaserDot.BeginAnimation(Canvas.LeftProperty, animX);
-                LaserDot.BeginAnimation(Canvas.TopProperty, animY);
-
-                // Hide dot after duration
-                Task.Delay(_durationMs, ct).ContinueWith(t => 
+                // Hide dot after highlight duration
+                Task.Delay(_durationMs, ct).ContinueWith(t =>
                 {
                     if (t.IsCanceled) return;
-                    Dispatcher.Invoke(() => LaserDot.Visibility = Visibility.Collapsed);
+                    Dispatcher.Invoke(() =>
+                    {
+                        LaserDot.BeginAnimation(Canvas.LeftProperty, null);
+                        LaserDot.Visibility = Visibility.Collapsed;
+                    });
                 });
             }
             catch (Exception ex)

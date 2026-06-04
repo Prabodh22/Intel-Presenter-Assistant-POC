@@ -59,14 +59,49 @@ public class KnowledgeBasePreprocessor
             PreprocessedAt = DateTime.UtcNow.ToString("o")
         };
 
+        // Pipeline: extract COM data (sequential) then fire API calls concurrently
+        // across slides using a sliding window of concurrent API tasks.
+        const int MaxConcurrentSlides = 5;
+        var semaphore = new SemaphoreSlim(MaxConcurrentSlides);
+        var slideTasks = new List<Task<(int index, SlideSnapshot snapshot)>>();
+
         for (int i = 1; i <= totalSlides; i++)
         {
             ct.ThrowIfCancellationRequested();
             SlideProgress?.Invoke(i, totalSlides);
 
             var slide = presentation.Slides[i];
-            var snapshot = await _slideReader.ReadSlideFullAsync(slide);
+            int slideIdx = i;
 
+            // Phase 1: COM extraction (must be sequential on STA thread)
+            var snapshot = _slideReader.ExtractShapesSync(slide);
+
+            // Phase 2: Export images from COM (sequential) and collect bytes
+            var imageExports = _slideReader.ExportImageBytes(snapshot, slide);
+
+            // Phase 3: API calls (OCR, explain, vision) — run concurrently across slides
+            await semaphore.WaitAsync(ct);
+            var task = Task.Run(async () =>
+            {
+                try
+                {
+                    await _slideReader.RunApiEnrichmentAsync(snapshot, imageExports, slide);
+                    return (slideIdx, snapshot);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }, ct);
+            slideTasks.Add(task);
+        }
+
+        // Wait for all API enrichment to complete
+        var results = await Task.WhenAll(slideTasks);
+
+        // Build KB from results (in slide order)
+        foreach (var (index, snapshot) in results.OrderBy(r => r.index))
+        {
             var slideKb = new SlideKB { Index = snapshot.SlideIndex };
 
             // Process text elements
@@ -125,6 +160,7 @@ public class KnowledgeBasePreprocessor
                     Title = string.IsNullOrWhiteSpace(img.Title) ? null : img.Title,
                     NearbyText = string.IsNullOrWhiteSpace(img.NearbyText) ? null : img.NearbyText,
                     Keywords = img.InferredKeywords.Count > 0 ? img.InferredKeywords : null,
+                    ChartNumericFacts = img.ChartNumericFacts.Count > 0 ? img.ChartNumericFacts : null,
                     GptDescription = string.IsNullOrWhiteSpace(img.GptDescription) ? null : img.GptDescription,
                     Embedding = img.SemanticEmbedding
                 });
@@ -132,7 +168,7 @@ public class KnowledgeBasePreprocessor
 
             kb.Slides.Add(slideKb);
             Log.Information("Preprocessed slide {Current}/{Total}: {TextCount} text, {ImageCount} image elements",
-                i, totalSlides, snapshot.TextElements.Count, snapshot.ImageElements.Count);
+                index, totalSlides, snapshot.TextElements.Count, snapshot.ImageElements.Count);
         }
 
         // Serialize to YAML

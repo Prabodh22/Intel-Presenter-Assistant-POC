@@ -79,7 +79,11 @@ public class OrchestratorIntegrationTests
         await Task.Delay(100); // Allow orchestrator to process initial slide change
 
         fixture.Audio.EmitChunk(CreateAudio(16000));
-        await Task.Delay(160);
+        // Matching is suppressed for 1500ms after slide change.
+        // Emit another chunk after grace so the loop re-enters transcription+matching.
+        await Task.Delay(1700);
+        fixture.Audio.EmitChunk(CreateAudio(16000));
+        await Task.Delay(250);
 
         await fixture.Orchestrator.StopAsync();
 

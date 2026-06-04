@@ -6,12 +6,16 @@ using Ppt = Microsoft.Office.Interop.PowerPoint;
 using Office = Microsoft.Office.Core;
 using Path = System.IO.Path;
 using File = System.IO.File;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using System.Text.Json;
 
 namespace PptPoc.PowerPoint;
 
 public class SlideReader : ISlideReader
 {
     private static readonly ILogger Log = Serilog.Log.ForContext<SlideReader>();
+    private static readonly object DebugArtifactLock = new();
 
     private readonly IOcrService? _ocr;
     private readonly IOpenAIVisionService? _gptVision;
@@ -58,8 +62,8 @@ public class SlideReader : ISlideReader
             _ = RunGptVisionOnSlideAsync(snapshot, slide);
         }
 
-        // Run OCR on all image elements asynchronously
-        if (_ocr != null && snapshot.ImageElements.Count > 0)
+        // Run image OCR/enrichment on all image elements asynchronously
+        if ((_ocr != null || _gptVision != null) && snapshot.ImageElements.Count > 0)
         {
             _ = RunOcrOnImagesAsync(snapshot.ImageElements, slide);
         }
@@ -101,7 +105,7 @@ public class SlideReader : ISlideReader
         // Await OCR and GPT-4o enrichment in parallel
         var tasks = new List<Task>();
 
-        if (_ocr != null && snapshot.ImageElements.Count > 0)
+        if ((_ocr != null || _gptVision != null) && snapshot.ImageElements.Count > 0)
             tasks.Add(RunOcrOnImagesAsync(snapshot.ImageElements, slide));
 
         if (_gptVision != null && snapshot.ImageElements.Count > 0)
@@ -114,6 +118,184 @@ public class SlideReader : ISlideReader
             snapshot.SlideIndex, snapshot.TextElements.Count, snapshot.ImageElements.Count);
 
         return snapshot;
+    }
+
+    // ── Pipeline methods for concurrent preprocessing ───────────────────
+
+    /// <summary>Phase 1: Extract shapes from COM (synchronous, STA thread only).</summary>
+    public SlideSnapshot ExtractShapesSync(object slideComObject)
+    {
+        var slide = (Ppt.Slide)slideComObject;
+        var snapshot = new SlideSnapshot
+        {
+            SlideIndex = slide.SlideIndex,
+            SlideId = slide.SlideID.ToString()
+        };
+
+        float sW = 960f, sH = 540f;
+        try { sW = slide.Master.Width; sH = slide.Master.Height; } catch { }
+
+        try
+        {
+            foreach (Ppt.Shape shape in slide.Shapes)
+            {
+                ProcessShape(shape, snapshot, null, slide, sW, sH);
+            }
+        }
+        catch (COMException ex)
+        {
+            Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>Phase 2: Export all image bytes from COM (synchronous, STA thread only).</summary>
+    public (List<(ImageElement img, int shapeId, byte[] bytes)> images, byte[]? slideImage, string manifest) ExportImageBytes(SlideSnapshot snapshot, object slideComObject)
+    {
+        var slide = (Ppt.Slide)slideComObject;
+        var imageData = new List<(ImageElement img, int shapeId, byte[] bytes)>();
+        byte[]? slideImageBytes = null;
+        string manifest = "";
+
+        // Export individual shape images
+        foreach (var img in snapshot.ImageElements)
+        {
+            try
+            {
+                var shapeId = ExtractShapeId(img.ElementId);
+                if (shapeId <= 0) continue;
+
+                if (_ocrCache.TryGetValue(shapeId, out var cachedWords))
+                {
+                    img.ExtractedWords = cachedWords;
+                    var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
+                    foreach (var word in TokenizeWords(NormalizeText(combinedText)))
+                    {
+                        if (!img.InferredKeywords.Contains(word))
+                            img.InferredKeywords.Add(word);
+                    }
+                    continue;
+                }
+
+                byte[]? imageBytes = ExportShapeAsImage(slide, shapeId);
+                if (imageBytes != null && imageBytes.Length > 0)
+                    imageData.Add((img, shapeId, imageBytes));
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Export failed for image element {Id}", img.ElementId);
+            }
+        }
+
+        // Export full slide image + build manifest for GPT vision
+        if (_gptVision != null && snapshot.ImageElements.Count > 0)
+        {
+            try
+            {
+                var manifestParts = new List<string>();
+                foreach (var img in snapshot.ImageElements)
+                    manifestParts.Add($"- Image ['{img.ElementId}']: box_2d [{img.BoundingBox255[0]}, {img.BoundingBox255[1]}, {img.BoundingBox255[2]}, {img.BoundingBox255[3]}], title '{img.Title}'");
+                foreach (var txt in snapshot.TextElements)
+                    manifestParts.Add($"- Text ['{txt.ElementId}']: box_2d [{txt.BoundingBox255[0]}, {txt.BoundingBox255[1]}, {txt.BoundingBox255[2]}, {txt.BoundingBox255[3]}], content: \"{txt.RawText}\"");
+                manifest = string.Join("\n", manifestParts);
+
+                var tempPath = Path.Combine(Path.GetTempPath(), $"slide_full_{Guid.NewGuid():N}.png");
+                slide.Export(tempPath, "PNG");
+                slideImageBytes = File.ReadAllBytes(tempPath);
+                File.Delete(tempPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to export slide image");
+            }
+        }
+
+        return (imageData, slideImageBytes, manifest);
+    }
+
+    /// <summary>Phase 3: Run API enrichment (OCR, explain, vision) — no COM needed, thread-safe.</summary>
+    public async Task RunApiEnrichmentAsync(
+        SlideSnapshot snapshot,
+        (List<(ImageElement img, int shapeId, byte[] bytes)> images, byte[]? slideImage, string manifest) exports,
+        object slideComObject)
+    {
+        var tasks = new List<Task>();
+
+        // GPT vision analysis on full slide (no COM needed — bytes already exported)
+        if (_gptVision != null && exports.slideImage != null)
+        {
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    string gptJson = await _gptVision.AnalyzeSlideAsync(exports.slideImage, exports.manifest);
+                    if (!string.IsNullOrWhiteSpace(gptJson))
+                    {
+                        // Strip markdown code fences that Claude sometimes wraps around JSON
+                        gptJson = gptJson.Trim();
+                        if (gptJson.StartsWith("```"))
+                        {
+                            var firstNewline = gptJson.IndexOf('\n');
+                            if (firstNewline > 0) gptJson = gptJson[(firstNewline + 1)..];
+                            if (gptJson.EndsWith("```")) gptJson = gptJson[..^3];
+                            gptJson = gptJson.Trim();
+                        }
+
+                        // Handle potentially truncated JSON from max_tokens limit
+                        JsonDocument? doc = null;
+                        try { doc = JsonDocument.Parse(gptJson); }
+                        catch (JsonException)
+                        {
+                            // Try to salvage by closing the JSON structure
+                            var salvaged = gptJson;
+                            // Find last complete object closing brace
+                            int lastBrace = salvaged.LastIndexOf('}');
+                            if (lastBrace > 0)
+                            {
+                                salvaged = salvaged[..(lastBrace + 1)] + "]}";
+                                try { doc = JsonDocument.Parse(salvaged); }
+                                catch { /* truly unparseable */ }
+                            }
+                        }
+
+                        if (doc != null)
+                        {
+                            using (doc)
+                            {
+                                if (doc.RootElement.TryGetProperty("elements", out var elemArr))
+                                {
+                                    foreach (var el in elemArr.EnumerateArray())
+                                    {
+                                        if (!el.TryGetProperty("id", out var idProp)) continue;
+                                        string id = idProp.GetString() ?? "";
+                                        string desc = el.TryGetProperty("rich_description", out var descProp)
+                                            ? descProp.GetString() ?? "" : "";
+                                        if (string.IsNullOrWhiteSpace(desc)) continue;
+                                        var imgTarget = snapshot.ImageElements.FirstOrDefault(x => x.ElementId == id);
+                                        if (imgTarget != null) imgTarget.GptDescription = desc;
+                                        var txtTarget = snapshot.TextElements.FirstOrDefault(x => x.ElementId == id);
+                                        if (txtTarget != null) txtTarget.GptDescription = desc;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Failed to run GPT vision analysis on slide.");
+                }
+            }));
+        }
+
+        // OCR + Explain for each image (parallel across images)
+        foreach (var (img, shapeId, bytes) in exports.images)
+        {
+            tasks.Add(ProcessSingleImageAsync(img, shapeId, bytes, snapshot.SlideIndex));
+        }
+
+        await Task.WhenAll(tasks);
     }
 
     private async Task RunGptVisionOnSlideAsync(SlideSnapshot snapshot, Ppt.Slide slide)
@@ -164,6 +346,8 @@ public class SlideReader : ISlideReader
 
     private async Task RunOcrOnImagesAsync(List<ImageElement> images, Ppt.Slide slide)
     {
+        // Phase 1: Export all images from COM (must be sequential — STA thread)
+        var imageData = new List<(ImageElement img, int shapeId, byte[] bytes)>();
         foreach (var img in images)
         {
             try
@@ -183,31 +367,67 @@ public class SlideReader : ISlideReader
                     continue;
                 }
 
-                // Run COM export on task pool to avoid blocking the slide-read thread heavily
                 byte[]? imageBytes = await Task.Run(() => ExportShapeAsImage(slide, shapeId));
                 if (imageBytes == null || imageBytes.Length == 0) continue;
 
-                var ocrWords = await _ocr!.ExtractTextAsync(imageBytes);
-                if (ocrWords.Count > 0)
-                {
-                    _ocrCache[shapeId] = ocrWords;
-                    img.ExtractedWords = ocrWords;
-
-                    var combinedText = string.Join(" ", ocrWords.Select(w => w.Text));
-                    var tokenized = TokenizeWords(NormalizeText(combinedText));
-                    foreach (var word in tokenized)
-                    {
-                        if (!img.InferredKeywords.Contains(word))
-                            img.InferredKeywords.Add(word);
-                    }
-
-                    Log.Debug("OCR on shape {Id}: {Count} words extracted", shapeId, ocrWords.Count);
-                }
+                imageData.Add((img, shapeId, imageBytes));
             }
             catch (Exception ex)
             {
-                Log.Warning(ex, "OCR failed for image element {Id}", img.ElementId);
+                Log.Warning(ex, "Export failed for image element {Id}", img.ElementId);
             }
+        }
+
+        // Phase 2: Run OCR + Explain API calls in parallel across all images
+        var tasks = imageData.Select(item => ProcessSingleImageAsync(item.img, item.shapeId, item.bytes, slide.SlideIndex)).ToList();
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ProcessSingleImageAsync(ImageElement img, int shapeId, byte[] imageBytes, int slideIndex)
+    {
+        try
+        {
+            List<OcrWordInfo> ocrWords = new();
+
+            if (_gptVision != null)
+            {
+                ocrWords = await _gptVision.ExtractOcrWordsAsync(imageBytes);
+            }
+
+            if (ocrWords.Count == 0 && _ocr != null)
+            {
+                ocrWords = await _ocr.ExtractTextAsync(imageBytes);
+            }
+
+            if (ocrWords.Count > 0)
+            {
+                _ocrCache[shapeId] = ocrWords;
+                img.ExtractedWords = ocrWords;
+
+                var combinedText = string.Join(" ", ocrWords.Select(w => w.Text));
+                var tokenized = TokenizeWords(NormalizeText(combinedText));
+                foreach (var word in tokenized)
+                {
+                    if (!img.InferredKeywords.Contains(word))
+                        img.InferredKeywords.Add(word);
+                }
+
+                Log.Debug("OCR on shape {Id}: {Count} words extracted", shapeId, ocrWords.Count);
+            }
+
+            // Per-image conceptual explanation (includes OCR hint tokens when available).
+            if (_gptVision != null && string.IsNullOrWhiteSpace(img.GptDescription))
+            {
+                var explanation = await _gptVision.ExplainImageAsync(imageBytes, ocrWords);
+                if (!string.IsNullOrWhiteSpace(explanation))
+                    img.GptDescription = explanation;
+            }
+
+            WriteImageDebugArtifact(slideIndex, img);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "OCR/explain failed for image element {Id}", img.ElementId);
         }
     }
 
@@ -388,6 +608,7 @@ public class SlideReader : ISlideReader
                 var title = GetTitle(shape);
                 var nearbyText = FindNearbyText(shape, snapshot);
                 var keywords = InferKeywords(altText, title, nearbyText);
+                var numericFacts = new List<string>();
 
                 snapshot.ImageElements.Add(new ImageElement
                 {
@@ -402,7 +623,8 @@ public class SlideReader : ISlideReader
                     AltText = altText,
                     Title = title,
                     NearbyText = nearbyText,
-                    InferredKeywords = keywords
+                    InferredKeywords = keywords,
+                    ChartNumericFacts = numericFacts
                 });
 
                 // Extract chart text data (categories, series names, chart title) as TextElements
@@ -452,8 +674,28 @@ public class SlideReader : ISlideReader
                                 dynamic series = seriesColl.Item(si);
                                 string? sn = (string?)series.Name;
                                 if (!string.IsNullOrWhiteSpace(sn)) chartTexts.Add(sn.Trim());
+
+                                // Capture numeric facts directly from chart values (much more reliable than OCR).
+                                object valsObj = series.Values;
+                                if (valsObj is object[] vals)
+                                {
+                                    foreach (var v in vals)
+                                    {
+                                        var numeric = NormalizeNumericFact(v?.ToString());
+                                        if (!string.IsNullOrWhiteSpace(numeric))
+                                            numericFacts.Add(numeric);
+                                    }
+                                }
                             }
                             catch (COMException) { }
+                        }
+
+                        // Keep unique numeric facts only.
+                        if (numericFacts.Count > 0)
+                        {
+                            numericFacts = numericFacts
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToList();
                         }
                     }
                     catch (COMException) { }
@@ -631,5 +873,66 @@ public class SlideReader : ISlideReader
             return new List<string>();
 
         return normalizedText.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+    }
+
+    private static string NormalizeNumericFact(string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return string.Empty;
+
+        var trimmed = input.Trim();
+        bool hasPercent = trimmed.Contains('%');
+        var cleaned = Regex.Replace(trimmed, @"[^0-9\.,\-]", string.Empty);
+
+        if (string.IsNullOrWhiteSpace(cleaned)) return string.Empty;
+
+        cleaned = cleaned.Replace(",", string.Empty);
+        if (!double.TryParse(cleaned, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            return string.Empty;
+
+        var normalized = value.ToString("0.####", CultureInfo.InvariantCulture);
+        return hasPercent ? normalized + "%" : normalized;
+    }
+
+    private static void WriteImageDebugArtifact(int slideIndex, ImageElement image)
+    {
+        try
+        {
+            var dir = Path.Combine(Environment.CurrentDirectory, "logs");
+            System.IO.Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, "slide_image_enrichment.ndjson");
+
+            var entry = new
+            {
+                ts_utc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                slide_index = slideIndex,
+                element_id = image.ElementId,
+                shape_name = image.ShapeName,
+                ocr_word_count = image.ExtractedWords?.Count ?? 0,
+                ocr_words_preview = (image.ExtractedWords ?? new List<OcrWordInfo>())
+                    .Take(10)
+                    .Select(w => new
+                    {
+                        text = w.Text,
+                        x = Math.Round(w.X, 4),
+                        y = Math.Round(w.Y, 4),
+                        w = Math.Round(w.Width, 4),
+                        h = Math.Round(w.Height, 4)
+                    })
+                    .ToList(),
+                image_explanation_preview = string.IsNullOrWhiteSpace(image.GptDescription)
+                    ? string.Empty
+                    : image.GptDescription.Substring(0, Math.Min(300, image.GptDescription.Length))
+            };
+
+            var line = JsonSerializer.Serialize(entry);
+            lock (DebugArtifactLock)
+            {
+                File.AppendAllText(path, line + Environment.NewLine);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Failed writing image enrichment debug artifact for {ElementId}", image.ElementId);
+        }
     }
 }

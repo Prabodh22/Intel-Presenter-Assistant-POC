@@ -30,6 +30,8 @@ public class ImageElement : SlideElement
     public string Title { get; set; } = string.Empty;
     public string NearbyText { get; set; } = string.Empty;
     public List<string> InferredKeywords { get; set; } = new();
+    // Normalized numeric values extracted from chart objects (for example: 25, 12.5, 40%)
+    public List<string> ChartNumericFacts { get; set; } = new();
 }
 
 public class SlideSnapshot

@@ -80,6 +80,7 @@ public class KnowledgeBaseLoader
                         Title = el.Title ?? string.Empty,
                         NearbyText = el.NearbyText ?? string.Empty,
                         InferredKeywords = el.Keywords ?? new List<string>(),
+                        ChartNumericFacts = el.ChartNumericFacts ?? new List<string>(),
                         GptDescription = el.GptDescription ?? string.Empty,
                         SemanticEmbedding = el.Embedding
                     });

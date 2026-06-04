@@ -76,6 +76,9 @@ public class ElementKB
     [YamlMember(Alias = "keywords")]
     public List<string>? Keywords { get; set; }
 
+    [YamlMember(Alias = "chart_numeric_facts")]
+    public List<string>? ChartNumericFacts { get; set; }
+
     // Shared enrichment
     [YamlMember(Alias = "gpt_description")]
     public string? GptDescription { get; set; }

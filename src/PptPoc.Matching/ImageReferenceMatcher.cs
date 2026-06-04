@@ -5,6 +5,9 @@ namespace PptPoc.Matching;
 
 public static class ImageReferenceMatcher
 {
+    private static readonly System.Text.RegularExpressions.Regex NumericTokenRegex =
+        new(@"^\d+(?:\.\d+)?%?$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
     private static readonly string[] SpatialPhrases =
     {
         "this image", "this picture", "this photo", "this diagram",
@@ -14,7 +17,16 @@ public static class ImageReferenceMatcher
         "as you can see", "shown here", "look at this",
         "this slide shows", "here we see", "on the right",
         "on the left", "at the top", "at the bottom",
-        "this table", "the table"
+        "this table", "the table",
+        "below image", "image below", "the below image", "in the below",
+        "figure below", "below figure", "the below figure",
+        "chart below", "below chart", "the below chart",
+        "diagram below", "below diagram",
+        "image above", "above image", "figure above", "above figure",
+        "image on the right", "image on the left",
+        "chart on the right", "chart on the left",
+        "see here", "see below", "shown below", "shown above",
+        "depicted here", "illustrated here"
     };
 
     private static readonly Dictionary<string, int> OrdinalMap = new(StringComparer.OrdinalIgnoreCase)
@@ -40,12 +52,15 @@ public static class ImageReferenceMatcher
         OcrWordInfo? bestWord = null;
 
         // 1a. Semantic matching against the GPT-4o conceptual description
+        // Cap at 0.50 — semantic similarity alone is too noisy for images.
+        // It provides a baseline but should not trigger highlights without other evidence.
         if (transcriptEmbedding != null && semanticService.IsReady && image.SemanticEmbedding != null)
         {
             double semanticOcr = semanticService.ComputeCosineSimilarity(transcriptEmbedding, image.SemanticEmbedding);
-            if (semanticOcr > bestScore)
+            double cappedSemantic = Math.Min(semanticOcr, 0.35);
+            if (cappedSemantic > bestScore)
             {
-                bestScore = semanticOcr;
+                bestScore = cappedSemantic;
                 bestPhrase = transcriptText;
                 bestWord = null; // Whole image
             }
@@ -58,22 +73,48 @@ public static class ImageReferenceMatcher
             int ocrHitCount = 0;
             foreach (var word in image.ExtractedWords)
             {
-                if (word.Text.Length < 3) continue; // Skip noise: "1", "a", "%", etc.
+                bool isNumericToken = NumericTokenRegex.IsMatch(word.Text);
+                if (word.Text.Length < 3 && !isNumericToken) continue; // keep meaningful numerics, skip short noise
 
                 var (wordScore, wordPhrase) = FuzzyMatcher.Score(transcriptText, word.Text);
                 if (wordScore > 0.7)
                 {
                     ocrHitCount++;
-                    // Single OCR word matches are capped at 0.45 to avoid false positives.
-                    // Multiple hits or longer phrases score higher.
-                    double adjustedScore = ocrHitCount >= 2 ? wordScore * 1.1 : Math.Min(wordScore, 0.45);
-                    if (adjustedScore > 1.0) adjustedScore = 1.0;
+                    // Single OCR word matches are capped to avoid false positives from
+                    // generic words like "support", "intel" matching ASR noise.
+                    // Need 4+ matching OCR words for uncapped score.
+                    double adjustedScore;
+                    if (ocrHitCount >= 4)
+                        adjustedScore = Math.Min(wordScore * 1.1, 1.0);
+                    else if (ocrHitCount == 3)
+                        adjustedScore = Math.Min(wordScore, 0.70);
+                    else if (ocrHitCount == 2)
+                        adjustedScore = Math.Min(wordScore, 0.60);
+                    else
+                        adjustedScore = word.Text.Length >= 5
+                            ? Math.Min(wordScore, 0.45)
+                            : Math.Min(wordScore, 0.30);
                     if (adjustedScore > bestScore)
                     {
                         bestScore = adjustedScore;
                         bestPhrase = wordPhrase;
                         bestWord = word;
                     }
+                }
+            }
+
+            // Density gate: if the transcript is long but only a few keywords match,
+            // scale the score down. Prevents noisy ASR ("supports...opium intel...CPP")
+            // from triggering image highlights. Legitimate references like 
+            // "this chart shows revenue trend" have higher match density.
+            if (ocrHitCount >= 2 && bestScore > 0.3)
+            {
+                var tTokens = TextNormalizer.Tokenize(TextNormalizer.Normalize(transcriptText));
+                double density = (double)ocrHitCount / Math.Max(1, tTokens.Count);
+                // If less than 20% of transcript words match image keywords, scale down
+                if (density < 0.20 && tTokens.Count >= 8)
+                {
+                    bestScore *= (0.5 + density * 2.5); // e.g. 10% density → 0.75x, 5% density → 0.625x
                 }
             }
         }
@@ -103,11 +144,36 @@ public static class ImageReferenceMatcher
             if (candidateWordCount <= 3 && fuzzyScore < 0.01)
                 highestCandidateMatch = 0.0; // Suppress semantic-only for short metadata
             else
-                highestCandidateMatch = Math.Max(fuzzyScore, semanticCandidate);
+            {
+                // Cap semantic-only candidate matches at 0.50 for images
+                double cappedSemanticCandidate = fuzzyScore > 0.01 ? semanticCandidate : Math.Min(semanticCandidate, 0.35);
+                highestCandidateMatch = Math.Max(fuzzyScore, cappedSemanticCandidate);
+            }
             
             if (highestCandidateMatch > bestScore)
             {
-                bestScore = highestCandidateMatch;
+                // Density gate for keyword matches: scale down when matched words
+                // are a tiny fraction of a long transcript (scattered noise).
+                double keywordPenalty = 1.0;
+                if (fuzzyScore > 0.3 && candidateWordCount >= 3)
+                {
+                    var tTokens2 = TextNormalizer.Tokenize(tNorm);
+                    if (tTokens2.Count >= 8)
+                    {
+                        // Count how many candidate words actually appear in transcript
+                        var candTokens = TextNormalizer.Tokenize(TextNormalizer.Normalize(candidate));
+                        int hits = candTokens.Count(cw => cw.Length >= 3 && tTokens2.Any(tw =>
+                            string.Equals(tw, cw, StringComparison.OrdinalIgnoreCase) ||
+                            (tw.Length >= 4 && cw.Length >= 4 &&
+                             (tw.StartsWith(cw, StringComparison.OrdinalIgnoreCase) ||
+                              cw.StartsWith(tw, StringComparison.OrdinalIgnoreCase)))));
+                        double density = (double)hits / tTokens2.Count;
+                        if (density < 0.20)
+                            keywordPenalty = 0.5 + density * 2.5;
+                    }
+                }
+
+                bestScore = highestCandidateMatch * keywordPenalty;
                 bestPhrase = semanticCandidate > fuzzyScore ? transcriptText : phrase;
                 bestWord = null; // These apply to the whole image
             }
@@ -130,8 +196,8 @@ public static class ImageReferenceMatcher
 
                 if (sp.Contains("left")) { isDirectional = true; directionMatched = isLeftmost; }
                 else if (sp.Contains("right")) { isDirectional = true; directionMatched = isRightmost; }
-                else if (sp.Contains("top")) { isDirectional = true; directionMatched = isTopmost; }
-                else if (sp.Contains("bottom")) { isDirectional = true; directionMatched = isBottommost; }
+                else if (sp.Contains("top") || sp.Contains("above")) { isDirectional = true; directionMatched = isTopmost; }
+                else if (sp.Contains("bottom") || sp.Contains("below")) { isDirectional = true; directionMatched = isBottommost; }
 
                 if (isDirectional)
                 {
@@ -156,17 +222,41 @@ public static class ImageReferenceMatcher
             }
         }
 
+        // Ordinal matching: require an image/chart noun within ±3 words of the ordinal,
+        // not just anywhere in the transcript ("second" in casual speech shouldn't match).
+        string[] imageNouns = { "image", "picture", "photo", "diagram", "chart", "graph", "figure", "illustration", "table" };
         if (allImages.Count > 1)
         {
+            var tTokens = TextNormalizer.Tokenize(tNorm);
             foreach (var (ordinalWord, ordinalIndex) in OrdinalMap)
             {
                 if (tNorm.Contains(ordinalWord) && ordinalIndex == imagePositionIndex)
                 {
-                    bestScore = Math.Max(bestScore, 0.8);
-                    spatialBoost = Math.Max(spatialBoost, 0.8);
-                    bestPhrase = string.IsNullOrEmpty(bestPhrase)
-                        ? $"{ordinalWord} image"
-                        : $"{ordinalWord} {bestPhrase}";
+                    // Find ordinal position and require image noun within ±3 tokens
+                    int ordinalPos = tTokens.FindIndex(t => t.Equals(ordinalWord, StringComparison.OrdinalIgnoreCase));
+                    bool hasImageNoun = false;
+                    if (ordinalPos >= 0)
+                    {
+                        int wStart = Math.Max(0, ordinalPos - 3);
+                        int wEnd = Math.Min(tTokens.Count - 1, ordinalPos + 3);
+                        for (int j = wStart; j <= wEnd; j++)
+                        {
+                            if (j == ordinalPos) continue;
+                            if (imageNouns.Any(noun => tTokens[j].Equals(noun, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                hasImageNoun = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (hasImageNoun)
+                    {
+                        bestScore = Math.Max(bestScore, 0.8);
+                        spatialBoost = Math.Max(spatialBoost, 0.8);
+                        bestPhrase = string.IsNullOrEmpty(bestPhrase)
+                            ? $"{ordinalWord} image"
+                            : $"{ordinalWord} {bestPhrase}";
+                    }
                     break;
                 }
             }

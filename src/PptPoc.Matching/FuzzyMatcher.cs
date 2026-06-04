@@ -124,9 +124,11 @@ public static class FuzzyMatcher
     {
         for (int i = 0; i < contentWords.Count - 1; i++)
         {
-            var pair = $"{contentWords[i]} {contentWords[i + 1]}";
-            if (pair.Length >= 8 &&
-                transcriptNorm.Contains(pair, StringComparison.OrdinalIgnoreCase))
+            var forward = $"{contentWords[i]} {contentWords[i + 1]}";
+            var reverse = $"{contentWords[i + 1]} {contentWords[i]}";
+            if (forward.Length >= 8 &&
+                (transcriptNorm.Contains(forward, StringComparison.OrdinalIgnoreCase) ||
+                 transcriptNorm.Contains(reverse, StringComparison.OrdinalIgnoreCase)))
                 return true;
         }
         return false;

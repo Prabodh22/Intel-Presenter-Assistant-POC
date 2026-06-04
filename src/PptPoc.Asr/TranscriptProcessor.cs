@@ -83,6 +83,71 @@ public class TranscriptProcessor : ITranscriptProcessor
         }
     }
 
+    public string GetRecentTranscriptTextForDisplay(TimeSpan window)
+    {
+        lock (_lock)
+        {
+            var cutoff = DateTime.UtcNow - window;
+            var recentTexts = _chunks
+                .Where(c => c.ReceivedAt >= cutoff)
+                .OrderBy(c => c.ReceivedAt)
+                .Select(c => c.Text)
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .ToList();
+
+            if (recentTexts.Count == 0)
+                return string.Empty;
+
+            // ASR runs on overlapping windows, so consecutive chunks often repeat.
+            // Collapse overlap for UI readability only.
+            var mergedTokens = SplitTokens(recentTexts[0]);
+            for (int i = 1; i < recentTexts.Count; i++)
+            {
+                var nextTokens = SplitTokens(recentTexts[i]);
+                if (nextTokens.Count == 0)
+                    continue;
+
+                int overlap = FindTokenOverlap(mergedTokens, nextTokens);
+                for (int j = overlap; j < nextTokens.Count; j++)
+                {
+                    mergedTokens.Add(nextTokens[j]);
+                }
+            }
+
+            return string.Join(" ", mergedTokens);
+        }
+    }
+
+    private static List<string> SplitTokens(string text)
+    {
+        return text
+            .Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .ToList();
+    }
+
+    private static int FindTokenOverlap(List<string> existing, List<string> next)
+    {
+        int max = Math.Min(existing.Count, next.Count);
+        for (int len = max; len >= 1; len--)
+        {
+            bool match = true;
+            int start = existing.Count - len;
+            for (int i = 0; i < len; i++)
+            {
+                if (!existing[start + i].Equals(next[i], StringComparison.OrdinalIgnoreCase))
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+                return len;
+        }
+
+        return 0;
+    }
+
     public List<string> GetRecentKeywords(TimeSpan window)
     {
         var text = GetRecentTranscriptText(window);

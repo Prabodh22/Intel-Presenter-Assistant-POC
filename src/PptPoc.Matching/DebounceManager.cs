@@ -9,6 +9,7 @@ public class DebounceManager
     private static readonly ILogger Log = Serilog.Log.ForContext<DebounceManager>();
 
     private readonly AppConfig _config;
+    private readonly Func<DateTime> _clock;
 
     // Per-element cooldown tracking
     private readonly ConcurrentDictionary<string, DateTime> _lastHighlightTime = new();
@@ -26,9 +27,12 @@ public class DebounceManager
     private readonly Queue<string> _recentWinners = new();
     private const int SlidingWindowSize = 5;
 
-    public DebounceManager(AppConfig config)
+    public DebounceManager(AppConfig config) : this(config, () => DateTime.UtcNow) { }
+
+    public DebounceManager(AppConfig config, Func<DateTime> clock)
     {
         _config = config;
+        _clock = clock;
     }
 
     /// <summary>
@@ -36,7 +40,7 @@ public class DebounceManager
     /// </summary>
     public bool ShouldHighlight(string elementId, double confidence, PptPoc.Core.Models.MatchType matchType)
     {
-        var now = DateTime.UtcNow;
+        var now = _clock();
 
         // Sliding window stability filter
         _recentWinners.Enqueue(elementId);
@@ -45,9 +49,7 @@ public class DebounceManager
             _recentWinners.Dequeue();
         }
 
-        int requiredCycles = matchType == PptPoc.Core.Models.MatchType.ImageMatch
-            ? _config.StabilityRequiredCycles * 2
-            : _config.StabilityRequiredCycles;
+        int requiredCycles = _config.StabilityRequiredCycles;
 
         int votes = _recentWinners.Count(x => x == elementId);
         if (votes < requiredCycles)
@@ -91,7 +93,7 @@ public class DebounceManager
     /// </summary>
     public void RecordHighlight(string elementId, double confidence = 1.0)
     {
-        var now = DateTime.UtcNow;
+        var now = _clock();
         _lastHighlightTime[elementId] = now;
         _lastGlobalHighlight = now;
 
