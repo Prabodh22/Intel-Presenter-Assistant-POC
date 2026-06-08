@@ -10,6 +10,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="120"/>
@@ -26,8 +27,16 @@
             </StackPanel>
         </Border>
 
+        <!-- GNAI Token -->
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8" VerticalAlignment="Center">
+            <TextBlock Text="GNAI Token:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <PasswordBox x:Name="GnaiTokenBox" Width="320" Height="28" Margin="0,0,8,0"/>
+            <Button x:Name="ApplyTokenButton" Content="Set Token" Width="90" Height="28"
+                    Click="ApplyTokenButton_Click" Background="#607D8B" Foreground="White" FontWeight="Bold"/>
+        </StackPanel>
+
         <!-- Controls -->
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,8">
             <Button x:Name="StartButton" Content="Start" Width="80" Height="30" Margin="0,0,8,0"
                     Click="StartButton_Click" Background="#4CAF50" Foreground="White" FontWeight="Bold"/>
             <Button x:Name="StopButton" Content="Stop" Width="80" Height="30" Margin="0,0,8,0"
@@ -40,7 +49,7 @@
         </StackPanel>
 
         <!-- Live Transcript -->
-        <GroupBox Grid.Row="3" Header="Live Transcript" Margin="0,0,0,8">
+        <GroupBox Grid.Row="4" Header="Live Transcript" Margin="0,0,0,8">
             <ScrollViewer x:Name="TranscriptScroller" VerticalScrollBarVisibility="Auto">
                 <TextBlock x:Name="TranscriptText" TextWrapping="Wrap" Padding="4"
                            Foreground="#333333" FontSize="13"/>
@@ -48,9 +57,9 @@
         </GroupBox>
 
         <!-- Label -->
-        <TextBlock Grid.Row="4" Text="Highlight Log" FontWeight="SemiBold" Margin="0,0,0,4"/>
+        <TextBlock Grid.Row="5" Text="Highlight Log" FontWeight="SemiBold" Margin="0,0,0,4"/>
 
         <!-- Highlight Log -->
-        <ListBox Grid.Row="5" x:Name="HighlightLog" FontSize="11" Foreground="#555555"/>
+        <ListBox Grid.Row="6" x:Name="HighlightLog" FontSize="11" Foreground="#555555"/>
     </Grid>
 </Window>

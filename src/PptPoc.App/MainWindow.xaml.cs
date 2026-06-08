@@ -51,7 +51,8 @@ public partial class MainWindow : Window
         });
 
         var transcriptProcessor = new TranscriptProcessor(_config);
-        var matcherEngine = new MatcherEngine(_config, _semanticService);
+        var ragAgent = new RAGAgent(_config);
+        var matcherEngine = new MatcherEngine(_config, _semanticService, ragAgent);
         var renderer = new SlideshowLaserRenderer(_config);
         renderer.EnsureOverlay();
         var debounce = new DebounceManager(_config);
@@ -66,7 +67,9 @@ public partial class MainWindow : Window
             matcherEngine,
             renderer,
             debounce,
-            _kbLoader);
+            _kbLoader,
+            ragAgent,
+            _semanticService);
 
         _orchestrator.StatusChanged += msg => Dispatcher.Invoke(() => StatusText.Text = msg);
         _orchestrator.TranscriptUpdated += text => Dispatcher.Invoke(() =>
@@ -111,6 +114,40 @@ public partial class MainWindow : Window
             StatusText.Text = $"Error: {ex.Message}";
             StartButton.IsEnabled = true;
             StopButton.IsEnabled = false;
+        }
+    }
+
+    private void ApplyTokenButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var token = GnaiTokenBox.Password?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                StatusText.Text = "Please enter a non-empty GNAI token.";
+                return;
+            }
+
+            // Set for current process immediately (used by OpenAIVisionService at call time).
+            Environment.SetEnvironmentVariable("GNAI_TOKEN", token, EnvironmentVariableTarget.Process);
+
+            // Persist for future app launches.
+            try
+            {
+                Environment.SetEnvironmentVariable("GNAI_TOKEN", token, EnvironmentVariableTarget.User);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not persist GNAI token to user environment");
+            }
+
+            StatusText.Text = "GNAI token set. Vision calls will use it now.";
+            Log.Information("GNAI token set from UI input");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to set GNAI token from UI");
+            StatusText.Text = "Failed to set token. See logs.";
         }
     }
 
@@ -200,13 +237,14 @@ public partial class MainWindow : Window
 
         try
         {
-            StatusText.Text = "Warming up ASR & Embeddings... Downloading models...";
+            StatusText.Text = "Warming up ASR & Embeddings... Checking local model cache...";
             StartButton.IsEnabled = false;
             DownloadProgressBar.Visibility = Visibility.Visible;
 
             // Initialize OCR, ASR and Semantic matching concurrently
             var ocrTask = _ocrService.InitializeAsync();
-            var asrTask = _asrService.InitializeAsync(_config.ParakeetModelPath ?? "models/parakeet", _config.OpenVinoDevice);
+            var device = _config.ForceCpuMode ? "CPU" : _config.OpenVinoDevice;
+            var asrTask = _asrService.InitializeAsync(_config.ParakeetModelPath ?? "models/parakeet", device);
             var semanticTask = _semanticService.InitializeAsync(_config.SemanticModelPath ?? "models/minilm");
             
             await Task.WhenAll(ocrTask, asrTask, semanticTask);

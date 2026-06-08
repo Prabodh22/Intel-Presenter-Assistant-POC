@@ -17,6 +17,7 @@ namespace PptPoc.Asr;
 public sealed class ParakeetAsrService : IAsrService
 {
     private static readonly ILogger Log = Serilog.Log.ForContext<ParakeetAsrService>();
+    private const string SharedModelRootFolder = "PptPoc.App";
 
     private static readonly string[] ModelFiles =
     {
@@ -104,8 +105,11 @@ public sealed class ParakeetAsrService : IAsrService
     {
         ThrowIfDisposed();
 
-        var root = string.IsNullOrWhiteSpace(modelPath) ? "models" : modelPath;
-        var modelDir = Path.GetFullPath(Path.Combine(root, "parakeet"));
+        var configuredPath = string.IsNullOrWhiteSpace(modelPath) ? "models/parakeet" : modelPath;
+        var resolvedPath = ResolveStableModelPath(configuredPath);
+        var modelDir = Path.GetFileName(resolvedPath).Equals("parakeet", StringComparison.OrdinalIgnoreCase)
+            ? resolvedPath
+            : Path.Combine(resolvedPath, "parakeet");
         Directory.CreateDirectory(modelDir);
 
         Log.Information("Initializing Parakeet ASR. ModelDir={ModelDir}, Device={Device}", modelDir, openVinoDevice);
@@ -124,7 +128,8 @@ public sealed class ParakeetAsrService : IAsrService
             DisposeOpenVinoHandles();
             await Task.Delay(1000); // Add a delay to allow file handles to be released
 
-            var retryDir = Path.Combine(root, $"parakeet_repair_{DateTime.UtcNow:yyyyMMddHHmmss}");
+            var retryBaseDir = Path.GetDirectoryName(modelDir) ?? modelDir;
+            var retryDir = Path.Combine(retryBaseDir, $"parakeet_repair_{DateTime.UtcNow:yyyyMMddHHmmss}");
             Directory.CreateDirectory(retryDir);
 
             var retryFiles = GetInvalidOrMissingFiles(retryDir, forceDownload: true);
@@ -135,6 +140,22 @@ public sealed class ParakeetAsrService : IAsrService
         IsReady = true;
         Log.Information("Parakeet ASR initialized. EncFrames={Frames}, EncHidden={EncHidden}, DecHidden={DecHidden}",
             _encoderExpectedFrames, _encoderHiddenSize, _decoderHiddenSize);
+    }
+
+    private static string ResolveStableModelPath(string configuredPath)
+    {
+        var path = configuredPath.Trim().Replace('/', Path.DirectorySeparatorChar);
+
+        if (Path.IsPathRooted(path))
+        {
+            return Path.GetFullPath(path);
+        }
+
+        var sharedRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            SharedModelRootFolder);
+
+        return Path.GetFullPath(Path.Combine(sharedRoot, path));
     }
 
     public Task<List<TranscriptChunk>> TranscribeAsync(float[] audioSamples)
@@ -730,9 +751,24 @@ public sealed class ParakeetAsrService : IAsrService
             Path.Combine(modelDir, "parakeet_melspectogram.xml"),
             new DeviceOptions("CPU"));
 
-        _encoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_encoder.xml"), new DeviceOptions(device));
-        _decoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_decoder.xml"), new DeviceOptions(device));
-        _jointModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_joint.xml"), new DeviceOptions(device));
+        string actualDevice = device;
+        try
+        {
+            _encoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_encoder.xml"), new DeviceOptions(device));
+            _decoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_decoder.xml"), new DeviceOptions(device));
+            _jointModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_joint.xml"), new DeviceOptions(device));
+            Log.Information("Parakeet models compiled on device: {Device}", device);
+        }
+        catch (Exception ex)
+        {
+            // Fallback to CPU if GPU device fails
+            Log.Warning(ex, "Failed to initialize on device {Device}, falling back to CPU", device);
+            actualDevice = "CPU";
+            _encoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_encoder.xml"), new DeviceOptions("CPU"));
+            _decoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_decoder.xml"), new DeviceOptions("CPU"));
+            _jointModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_joint.xml"), new DeviceOptions("CPU"));
+            Log.Information("Parakeet models compiled on fallback device: CPU");
+        }
 
         ResolvePortsAndShapes();
         LoadVocab(Path.Combine(modelDir, "parakeet_vocab.json"));

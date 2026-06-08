@@ -16,6 +16,7 @@ namespace PptPoc.Matching;
 public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
 {
     private static readonly ILogger Log = Serilog.Log.ForContext<SemanticEmbeddingService>();
+    private const string SharedModelRootFolder = "PptPoc.App";
     private const string HfBaseUrl = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/";
     private const string ModelFile = "model_quantized.onnx"; 
     
@@ -28,7 +29,7 @@ public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
 
     public async Task InitializeAsync(string modelDir)
     {
-        modelDir = Path.GetFullPath(modelDir);
+        modelDir = ResolveStableModelPath(modelDir, "models/minilm");
         Directory.CreateDirectory(modelDir);
         var modelPath = Path.Combine(modelDir, ModelFile);
         var vocabPath = Path.Combine(modelDir, "vocab.txt");
@@ -53,6 +54,23 @@ public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
         _session = new InferenceSession(modelPath, options);
 
         Log.Information("Semantic Embedding Service initialized successfully.");
+    }
+
+    private static string ResolveStableModelPath(string configuredPath, string defaultRelativePath)
+    {
+        var path = string.IsNullOrWhiteSpace(configuredPath) ? defaultRelativePath : configuredPath.Trim();
+        path = path.Replace('/', Path.DirectorySeparatorChar);
+
+        if (Path.IsPathRooted(path))
+        {
+            return Path.GetFullPath(path);
+        }
+
+        var sharedRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            SharedModelRootFolder);
+
+        return Path.GetFullPath(Path.Combine(sharedRoot, path));
     }
 
     private async Task DownloadFileIfMissingAsync(string url, string destPath)

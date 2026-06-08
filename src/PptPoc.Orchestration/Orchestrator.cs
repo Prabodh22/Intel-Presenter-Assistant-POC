@@ -3,6 +3,8 @@ using PptPoc.Core.Interfaces;
 using PptPoc.Core.Models;
 using PptPoc.Matching;
 using Serilog;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace PptPoc.Orchestration;
 
@@ -21,6 +23,8 @@ public class Orchestrator : IOrchestrator
     private readonly IHighlightRenderer _renderer;
     private readonly DebounceManager _debounce;
     private readonly KnowledgeBaseLoader? _kbLoader;
+    private readonly IRAGAgent? _ragAgent;
+    private readonly ISemanticEmbeddingService? _semanticService;
 
     private CancellationTokenSource? _cts;
     private Task? _processingTask;
@@ -51,6 +55,10 @@ public class Orchestrator : IOrchestrator
     private SynchronizationContext? _uiContext;
 
     private bool _disposed;
+    private string _lastNotesPayload = string.Empty;
+    private int _lastNotesSlideIndex = -1;
+    private string? _lastDemoQueryForSlide;
+    private const double PresenterNotesMinScore = 0.35;
 
     public bool IsRunning => _cts != null && !_cts.IsCancellationRequested;
 
@@ -68,7 +76,9 @@ public class Orchestrator : IOrchestrator
         IMatcherEngine matcherEngine,
         IHighlightRenderer renderer,
         DebounceManager debounce,
-        KnowledgeBaseLoader? kbLoader = null)
+        KnowledgeBaseLoader? kbLoader = null,
+        IRAGAgent? ragAgent = null,
+        ISemanticEmbeddingService? semanticService = null)
     {
         _config = config;
         
@@ -93,6 +103,8 @@ public class Orchestrator : IOrchestrator
         _renderer = renderer;
         _debounce = debounce;
         _kbLoader = kbLoader;
+        _ragAgent = ragAgent;
+        _semanticService = semanticService;
     }
 
     public async Task StartAsync()
@@ -252,6 +264,9 @@ public class Orchestrator : IOrchestrator
                         _lastTranscriptText = string.Empty;
                         _samplesReceivedTotal = 0;
                         _lastTranscribedSampleTotal = 0;
+                        _lastNotesPayload = string.Empty;
+                        _lastNotesSlideIndex = -1;
+                        _lastDemoQueryForSlide = null;
 
                         // Update ASR vocabulary hints with text from the new slide
                         var keywords = snapshot.TextElements.SelectMany(t => t.Words)
@@ -363,6 +378,29 @@ public class Orchestrator : IOrchestrator
                         .ToList();
                     _asrService.SetVocabularyHints(keywords);
 
+                    // Initialize RAG agent for knowledge base augmentation
+                    Log.Debug("RAG Init check: ragAgent={RagAgentNull}, kbLoaded={KbLoaded}, semService={SemServiceNull}", 
+                        _ragAgent == null ? "null" : "present", 
+                        _kbLoader?.IsLoaded ?? false, 
+                        _semanticService == null ? "null" : "present");
+                    
+                    if (_ragAgent != null && _kbLoader?.IsLoaded == true && _semanticService != null)
+                    {
+                        _ragAgent.Initialize(_kbLoader, _currentSnapshot, _semanticService);
+                        Log.Information("RAG Agent initialized for slide {SlideIndex}", slideState.SlideIndex);
+
+                        // Optional no-speech demo trigger: set env var PPTPOC_RAG_DEMO_QUERY.
+                        var demoQuery = Environment.GetEnvironmentVariable("PPTPOC_RAG_DEMO_QUERY", EnvironmentVariableTarget.Process)
+                            ?? Environment.GetEnvironmentVariable("PPTPOC_RAG_DEMO_QUERY", EnvironmentVariableTarget.User);
+                        if (!string.IsNullOrWhiteSpace(demoQuery) && !string.Equals(_lastDemoQueryForSlide, demoQuery, StringComparison.Ordinal))
+                        {
+                            await _ragAgent.RetrieveContextAsync(demoQuery, topK: 5);
+                            await TryUpdatePresenterNotesAsync(_currentSnapshot, demoQuery);
+                            _lastDemoQueryForSlide = demoQuery;
+                            Log.Information("RAG demo trigger executed for slide {SlideIndex} with query '{Query}'", slideState.SlideIndex, demoQuery);
+                        }
+                    }
+
                     Log.Information("Slide changed to index {SlideIndex}", slideState.SlideIndex);
                     
                     // Critical Fix for Observation 1: Stop immediately after slide changes so we don't accidentally match 
@@ -380,7 +418,10 @@ public class Orchestrator : IOrchestrator
                         .Concat(_currentSnapshot.TextElements.Select(e => e.RawText))
                         .Concat(_currentSnapshot.ImageElements.SelectMany(i => i.InferredKeywords)));
 
-                var matches = _matcherEngine.Match(matchingTranscript, _currentSnapshot);
+                var matches = await _matcherEngine.MatchAsync(matchingTranscript, _currentSnapshot);
+
+                await TryUpdatePresenterNotesAsync(_currentSnapshot, matchingTranscript);
+
                 if (matches.Count == 0)
                     continue;
 
@@ -491,5 +532,161 @@ public class Orchestrator : IOrchestrator
         {
             // Swallow dispose exceptions during shutdown.
         }
+    }
+
+    private async Task TryUpdatePresenterNotesAsync(SlideSnapshot currentSnapshot, string transcript)
+    {
+        if (_ragAgent == null)
+            return;
+
+        if (!LooksLikeMeaningfulTechBusinessQuery(transcript))
+            return;
+
+        var context = _ragAgent.GetCachedContext();
+        if (context == null)
+            return;
+
+        string payload = BuildPresenterNotesPayload(currentSnapshot.SlideIndex, transcript, context, maxRows: 5);
+        if (string.IsNullOrWhiteSpace(payload))
+            return;
+
+        if (_lastNotesSlideIndex == currentSnapshot.SlideIndex && string.Equals(_lastNotesPayload, payload, StringComparison.Ordinal))
+            return;
+
+        bool updated = await RunOnUiAsync(() =>
+        {
+            var slideObj = _pptService.GetActiveSlideComObject();
+            if (slideObj == null)
+                return false;
+
+            return _pptService.UpsertNotesSection(slideObj, "PptPoc RAG Context", payload);
+        });
+
+        if (updated)
+        {
+            _lastNotesSlideIndex = currentSnapshot.SlideIndex;
+            _lastNotesPayload = payload;
+        }
+    }
+
+    private static string BuildPresenterNotesPayload(int activeSlideIndex, string transcript, RAGContext context, int maxRows)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Updated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine("Presenter Brief:");
+        sb.AppendLine("Audience question:");
+        sb.AppendLine($"- {transcript}");
+
+        var topRows = context.RetrievedTexts
+            .Select(t => new { Kind = "TEXT", t.SlideIndex, t.SimilarityScore, Content = t.Text })
+            .Concat(context.RetrievedImages.Select(i => new { Kind = "IMAGE", i.SlideIndex, i.SimilarityScore, Content = i.Description }))
+            .Where(x => x.SimilarityScore >= PresenterNotesMinScore)
+            .Where(x => !string.IsNullOrWhiteSpace(x.Content))
+            .OrderByDescending(x => x.SimilarityScore)
+            .GroupBy(x => NormalizeCompact(x.Content), StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .Take(Math.Max(1, maxRows))
+            .ToList();
+
+        sb.AppendLine("Suggested talking points:");
+
+        if (topRows.Count == 0)
+        {
+            sb.AppendLine("- No strong business/technical context found yet.");
+            sb.AppendLine("- Rephrase the question using a metric, model name, or benchmark term.");
+            return sb.ToString().TrimEnd();
+        }
+
+        var allValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int idx = 0; idx < topRows.Count; idx++)
+        {
+            var row = topRows[idx];
+            string cleaned = string.Join(' ', (row.Content ?? string.Empty)
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                .Trim();
+            if (cleaned.Length > 120)
+                cleaned = cleaned[..120] + "...";
+
+            var speakerLine = BuildSpeakerLine(cleaned);
+            if (!string.IsNullOrWhiteSpace(speakerLine))
+                sb.AppendLine($"- {speakerLine}");
+
+            foreach (var value in ExtractValues(cleaned))
+                allValues.Add(value);
+        }
+
+        sb.AppendLine("Data points to mention:");
+        if (allValues.Count == 0)
+        {
+            sb.AppendLine("- No explicit numeric value detected in top context.");
+        }
+        else
+        {
+            foreach (var value in allValues.Take(6))
+                sb.AppendLine($"- {value}");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private static bool LooksLikeMeaningfulTechBusinessQuery(string transcript)
+    {
+        if (string.IsNullOrWhiteSpace(transcript))
+            return false;
+
+        var tokens = transcript
+            .Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '-', '_', '/', '\\', '|', '(', ')' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim().ToLowerInvariant())
+            .Where(t => t.Length >= 3 && t.Any(char.IsLetter))
+            .ToList();
+
+        if (tokens.Count < 2)
+            return false;
+
+        var fillerOnly = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "yeah", "yes", "no", "ok", "okay", "so", "well", "hmm", "hello", "hi", "thanks", "thank", "you"
+        };
+
+        if (tokens.All(fillerOnly.Contains))
+            return false;
+
+        var businessTechHints = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "int4", "int8", "fp16", "fp32", "phi", "llm", "model", "benchmark", "latency", "throughput", "accuracy",
+            "openvino", "npu", "gpu", "cpu", "token", "quantization", "mmlu", "who", "what", "score", "business",
+            "cost", "kpi", "revenue", "margin", "forecast", "performance"
+        };
+
+        return tokens.Any(t => businessTechHints.Contains(t));
+    }
+
+    private static string NormalizeCompact(string text)
+    {
+        return string.Join(' ', text
+            .Split(new[] { '\r', '\n', '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            .Trim()
+            .ToLowerInvariant();
+    }
+
+    private static string BuildSpeakerLine(string content)
+    {
+        var insight = string.Join(' ', content
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Take(14));
+
+        if (string.IsNullOrWhiteSpace(insight))
+            return string.Empty;
+
+        return char.ToUpperInvariant(insight[0]) + insight[1..] + (insight.EndsWith('.') ? string.Empty : ".");
+    }
+
+    private static List<string> ExtractValues(string content)
+    {
+        return Regex.Matches(content, @"\b\d+(?:\.\d+)?(?:%|x|ms|s|fps|w|gb|mb|tb)?\b", RegexOptions.IgnoreCase)
+            .Select(m => m.Value)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(3)
+            .ToList();
     }
 }

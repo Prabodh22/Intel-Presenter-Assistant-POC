@@ -26,4 +26,5 @@ public class AppConfig
     public int HighlightBorderWeight { get; set; } = 4;
     public string LogFilePath { get; set; } = "logs/pptpoc-.log";
     public int OrchestratorLoopMs { get; set; } = 100;
+    public bool ForceCpuMode { get; set; } = false;
 }

@@ -12,4 +12,5 @@ public interface IPowerPointService : IDisposable
     object? GetActiveSlideComObject();
     object? GetActivePresentationComObject();
     bool IsSlideShowRunning();
+    bool UpsertNotesSection(object slideComObject, string sectionTitle, string content);
 }

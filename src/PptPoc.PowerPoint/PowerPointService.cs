@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using PptPoc.Core.Interfaces;
 using Serilog;
 using Ppt = Microsoft.Office.Interop.PowerPoint;
+using Office = Microsoft.Office.Core;
 
 namespace PptPoc.PowerPoint;
 
@@ -137,6 +138,69 @@ public class PowerPointService : IPowerPointService
         {
             return false;
         }
+    }
+
+    public bool UpsertNotesSection(object slideComObject, string sectionTitle, string content)
+    {
+        try
+        {
+            var slide = (Ppt.Slide)slideComObject;
+            var notesPage = slide.NotesPage;
+            if (notesPage == null)
+                return false;
+
+            string startMarker = $"[{sectionTitle} START]";
+            string endMarker = $"[{sectionTitle} END]";
+            string sectionText = $"{startMarker}\r\n{content}\r\n{endMarker}";
+
+            foreach (Ppt.Shape shape in notesPage.Shapes)
+            {
+                if (shape.HasTextFrame != Office.MsoTriState.msoTrue)
+                    continue;
+
+                var textRange = shape.TextFrame?.TextRange;
+                if (textRange == null)
+                    continue;
+
+                var existing = textRange.Text ?? string.Empty;
+                textRange.Text = UpsertSection(existing, sectionText, startMarker, endMarker);
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to update notes section '{SectionTitle}'", sectionTitle);
+            return false;
+        }
+    }
+
+    private static string UpsertSection(string existing, string sectionText, string startMarker, string endMarker)
+    {
+        int startIdx = existing.IndexOf(startMarker, StringComparison.Ordinal);
+        if (startIdx >= 0)
+        {
+            int endIdx = existing.IndexOf(endMarker, startIdx, StringComparison.Ordinal);
+            if (endIdx >= 0)
+            {
+                int endExclusive = endIdx + endMarker.Length;
+                string before = existing[..startIdx].TrimEnd();
+                string after = existing[endExclusive..].TrimStart();
+                if (string.IsNullOrWhiteSpace(before) && string.IsNullOrWhiteSpace(after))
+                    return sectionText;
+                if (string.IsNullOrWhiteSpace(before))
+                    return sectionText + "\r\n\r\n" + after;
+                if (string.IsNullOrWhiteSpace(after))
+                    return before + "\r\n\r\n" + sectionText;
+                return before + "\r\n\r\n" + sectionText + "\r\n\r\n" + after;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(existing))
+            return sectionText;
+
+        return existing.TrimEnd() + "\r\n\r\n" + sectionText;
     }
 
     public void Dispose()

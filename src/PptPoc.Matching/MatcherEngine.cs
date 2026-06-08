@@ -12,11 +12,13 @@ public class MatcherEngine : IMatcherEngine
 
     private readonly ConfidenceScorer _scorer;
     private readonly ISemanticEmbeddingService _semanticService;
+    private readonly IRAGAgent? _ragAgent;
 
-    public MatcherEngine(AppConfig config, ISemanticEmbeddingService semanticService)
+    public MatcherEngine(AppConfig config, ISemanticEmbeddingService semanticService, IRAGAgent? ragAgent = null)
     {
         _scorer = new ConfidenceScorer(config);
         _semanticService = semanticService;
+        _ragAgent = ragAgent;
     }
 
     public List<MatchResult> Match(string transcriptText, SlideSnapshot snapshot)
@@ -155,6 +157,62 @@ public class MatcherEngine : IMatcherEngine
         {
             Log.Debug("Matching found {Count} results. Top: {Type} '{Phrase}' confidence={Confidence:F2}",
                 results.Count, results[0].Type, results[0].MatchedPhrase, results[0].Confidence);
+        }
+
+        return results;
+    }
+
+    public async Task<List<MatchResult>> MatchAsync(string transcriptText, SlideSnapshot snapshot)
+    {
+        // First do regular matching
+        var results = Match(transcriptText, snapshot);
+
+        // Apply RAG augmentation if available
+        if (_ragAgent != null)
+        {
+            Log.Debug("RAG check: _ragAgent={RagNotNull}, IsReady={IsReady}", _ragAgent != null, _ragAgent.IsReady);
+            
+            if (_ragAgent.IsReady)
+            {
+                Log.Debug("RAG: Starting context retrieval for text: {Text}", transcriptText);
+                var ragContext = await _ragAgent.RetrieveContextAsync(transcriptText, topK: 5);
+                
+                if (ragContext.HasContext)
+                {
+                    Log.Information("RAG: Retrieved {TextCount} text + {ImageCount} image elements, boost={Boost:F2}",
+                        ragContext.RetrievedTexts.Count, ragContext.RetrievedImages.Count, ragContext.ContextConfidenceBoost);
+                    
+                    // Augment each result with RAG context
+                    for (int i = 0; i < results.Count; i++)
+                    {
+                        results[i] = _ragAgent.AugmentMatchConfidence(results[i], ragContext);
+                    }
+
+                    // Re-sort after augmentation
+                    results.Sort((a, b) =>
+                    {
+                        int cmp = b.Confidence.CompareTo(a.Confidence);
+                        if (cmp != 0) return cmp;
+                        if (a.Type == MatchType.TextMatch && b.Type == MatchType.ImageMatch) return -1;
+                        if (a.Type == MatchType.ImageMatch && b.Type == MatchType.TextMatch) return 1;
+                        return 0;
+                    });
+
+                    Log.Debug("RAG augmentation: applied confidence boost to {Count} results", results.Count);
+                }
+                else
+                {
+                    Log.Debug("RAG: No context retrieved (empty result)");
+                }
+            }
+            else
+            {
+                Log.Debug("RAG: Agent not ready (probably no KB loaded yet)");
+            }
+        }
+        else
+        {
+            Log.Debug("RAG: No RAG agent available");
         }
 
         return results;
