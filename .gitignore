@@ -1,0 +1,20 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+*.suo
+*.user
+publish/
+
+# Data and Models
+/models/
+/logs/
+*.log
+
+# Build artifacts
+*.zip
+kernel.errors.txt
+test_rag.cs
+
+# Optional: macOS/Windows specific
+.DS_Store
+Thumbs.db
