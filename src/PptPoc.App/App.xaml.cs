@@ -14,19 +14,32 @@ using System.Threading.Tasks;
 using System.Drawing;
 using PptPoc.Core.Interfaces;
 
+using Microsoft.Extensions.Configuration;
+using System.Threading;
+
 namespace PptPoc.App;
 
 public partial class App : Application
 {
+    private static Mutex? _mutex;
     private NotifyIcon? _notifyIcon;
     private Orchestrator? _orchestrator;
     private KnowledgeBasePreprocessor? _kbPreprocessor;
     private IPowerPointService? _pptService;
     private ToolStripMenuItem? _startMenuItem;
     private ToolStripMenuItem? _stopMenuItem;
+    private StatusIndicatorWindow? _statusIndicator;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
+        _mutex = new Mutex(true, "PptPocEngine_Unique_Mutex", out bool createdNew);
+        if (!createdNew)
+        {
+            System.Windows.MessageBox.Show("The Engine is already running in your System Tray!", "Already Running", MessageBoxButton.OK, MessageBoxImage.Information);
+            Current.Shutdown();
+            return;
+        }
+
         base.OnStartup(e);
 
         // Inject Proxy globally for the current process
@@ -50,9 +63,17 @@ public partial class App : Application
         var splash = new SplashWindow();
         splash.Show();
 
+        _statusIndicator = new StatusIndicatorWindow(config.LaserToggleHotkey);
+        _statusIndicator.Show();
+        _statusIndicator.UpdateStatus("Paused");
+
         await InitializeEngineAndStart(config, splash);
         
         splash.Close();
+        
+        // Wait for the UI layout to settle after the splash window closes
+        await Task.Delay(500);
+        _notifyIcon?.ShowBalloonTip(3000, "PPT Helper", "Running silently in background. Right-click the tray icon for options.", ToolTipIcon.Info);
     }
 
     private void EnsureTokenExists()
@@ -95,7 +116,8 @@ public partial class App : Application
                 if (_pptService != null && _kbPreprocessor != null)
                 {
                     _notifyIcon.Text = "PPT Highlighting Engine (Analyzing Slides...)";
-                    Log.Information("Manual start triggered. Analzying slides into YAML...");
+                    _statusIndicator?.UpdateStatus("Building KB");
+                    Log.Information("Manual start triggered. Analyzing slides into YAML...");
 
                     if (!_pptService.TryAttach())
                     {
@@ -109,6 +131,7 @@ public partial class App : Application
                 {
                     await _orchestrator.StartAsync(); 
                     UpdateMenuState(true);
+                    _statusIndicator?.Dispatcher.Invoke(() => _statusIndicator.Show());
                 }
             }
             catch (Exception ex)
@@ -125,6 +148,7 @@ public partial class App : Application
             {
                 await _orchestrator.StopAsync(); 
                 UpdateMenuState(false);
+                _statusIndicator?.Dispatcher.Invoke(() => _statusIndicator.Hide());
             }
         });
 
@@ -135,7 +159,21 @@ public partial class App : Application
         contextMenu.Items.Add(_stopMenuItem);
         
         contextMenu.Items.Add(new ToolStripSeparator());
-        contextMenu.Items.Add("Exit", null, (s, e) => Current.Shutdown());
+        contextMenu.Items.Add("Exit", null, (s, e) => 
+        {
+            Task.Run(async () => 
+            {
+                if (_orchestrator != null)
+                {
+                    await _orchestrator.StopAsync();
+                }
+                Dispatcher.Invoke(() => 
+                {
+                    _statusIndicator?.Close();
+                    Current.Shutdown();
+                });
+            });
+        });
 
         _notifyIcon.ContextMenuStrip = contextMenu;
     }
@@ -205,6 +243,30 @@ public partial class App : Application
                 config, pptService, slideReader, audioCapture, asrService, 
                 transcriptProcessor, matcherEngine, renderer, debounce, kbLoader, 
                 ragAgent, semanticService);
+
+            if (_statusIndicator != null)
+            {
+                _statusIndicator.ToggleLaserRequested += () => 
+                {
+                    if (_orchestrator != null && _orchestrator.IsRunning)
+                    {
+                        var newState = !_orchestrator.IsLaserEnabled;
+                        _orchestrator.IsLaserEnabled = newState;
+                        _statusIndicator.UpdateStatus(newState ? "Laser Enabled" : "Laser Disabled");
+                        Log.Information("HotKey triggered Laser State Change: {State}", newState);
+                    }
+                };
+                
+                _orchestrator.LaserStateChanged += (enabled) => 
+                {
+                    _statusIndicator.UpdateStatus(enabled ? "Laser Enabled" : "Laser Disabled");
+                };
+                
+                _orchestrator.StatusChanged += (msg) => 
+                {
+                    if (msg == "Microphone active") _statusIndicator.UpdateStatus("Listening");
+                };
+            }
 
             Log.Information("Engine successfully initialized via Tray. Waiting for manual start.");
             

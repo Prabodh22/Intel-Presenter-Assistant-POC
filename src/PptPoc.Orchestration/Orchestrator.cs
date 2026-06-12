@@ -26,6 +26,9 @@ public class Orchestrator : IOrchestrator
     private readonly IRAGAgent? _ragAgent;
     private readonly ISemanticEmbeddingService? _semanticService;
 
+    public bool IsLaserEnabled { get; set; } = false;
+    public event Action<bool>? LaserStateChanged;
+
     private CancellationTokenSource? _cts;
     private Task? _processingTask;
 
@@ -91,7 +94,6 @@ public class Orchestrator : IOrchestrator
         _config.HighlightDurationMs = 2000; // Keep highlights alive but not too long
         _config.CooldownMs = 800;           // Faster re-highlighting for responsiveness
         _config.GlobalCooldownMs = 300;     // Prevent jumping between elements too rapidly
-        _config.MatchConfidenceThreshold = 0.4; // Raise threshold to reduce false positives
         _config.StabilityRequiredCycles = 1;    // 1 cycle for both text and images
         
         _pptService = pptService;
@@ -111,6 +113,9 @@ public class Orchestrator : IOrchestrator
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        IsLaserEnabled = false;
+        LaserStateChanged?.Invoke(IsLaserEnabled);
+
         if (IsRunning)
         {
             Log.Warning("Orchestrator already running");
@@ -122,11 +127,13 @@ public class Orchestrator : IOrchestrator
 
         _uiContext = SynchronizationContext.Current;
 
-        // Attach to PowerPoint
-        if (!_pptService.TryAttach())
+        // Attach to PowerPoint (Wait safely in background)
+        while (!_pptService.TryAttach())
         {
-            StatusChanged?.Invoke("ERROR: PowerPoint not found. Open PowerPoint and try again.");
-            throw new InvalidOperationException("Could not attach to PowerPoint. Ensure PowerPoint is running with a presentation open.");
+            StatusChanged?.Invoke("Waiting for PowerPoint...");
+            Log.Debug("PowerPoint not ready. Retrying in 3 seconds.");
+            await Task.Delay(3000);
+            if (_disposed || (_cts?.IsCancellationRequested ?? false)) return;
         }
         StatusChanged?.Invoke("Connected to PowerPoint");
 
@@ -150,9 +157,18 @@ public class Orchestrator : IOrchestrator
         // Subscribe to audio chunks
         _audioCapture.AudioChunkReady += OnAudioChunkReady;
 
-        // Start audio capture
-        _audioCapture.Start(_config.AudioDeviceIndex);
-        StatusChanged?.Invoke("Microphone active");
+        try
+        {
+            // Start audio capture
+            _audioCapture.Start(_config.AudioDeviceIndex);
+            StatusChanged?.Invoke("Microphone active");
+        }
+        catch (Exception ex)
+        {
+            StatusChanged?.Invoke("ERROR: Microphone failed");
+            Log.Error(ex, "Failed to start microphone.");
+            throw new InvalidOperationException("No microphone detected or access is blocked. Please check your Windows Sound & Privacy settings.", ex);
+        }
 
         // Start processing loops
         _cts = new CancellationTokenSource();
@@ -289,7 +305,7 @@ public class Orchestrator : IOrchestrator
                 float[] audioSnapshot;
                 lock (_asrBufferLock)
                 {
-                    if (_asrBuffer.Count < SampleRateHz) // Need at least 1 second of audio
+                    if (_asrBuffer.Count < _asrMinStepSamples) // Process as soon as the minimum step threshold is reached
                         continue;
 
                     // Fetch an overlapping sliding window to give ASR the full acoustic context
@@ -323,6 +339,47 @@ public class Orchestrator : IOrchestrator
                         displayTranscriptText,
                         transcriptText);
                 }
+
+                string lowerTranscript = transcriptText?.ToLowerInvariant() ?? "";
+                if (lowerTranscript.Contains("laser on") && !IsLaserEnabled)
+                {
+                    IsLaserEnabled = true;
+                    LaserStateChanged?.Invoke(IsLaserEnabled);
+                    StatusChanged?.Invoke("Laser Enabled");
+                    _transcriptProcessor.Clear();
+                    lock (_asrBufferLock) { _asrBuffer.Clear(); }
+                    continue;
+                }
+                else if (lowerTranscript.Contains("laser off") && IsLaserEnabled)
+                {
+                    IsLaserEnabled = false;
+                    LaserStateChanged?.Invoke(IsLaserEnabled);
+                    StatusChanged?.Invoke("Laser Disabled");
+                    var slideObjParam = _pptService.GetActiveSlideComObject();
+                    if (slideObjParam != null) await RunOnUiAsync(() => _renderer.ClearAll(slideObjParam));
+                    _transcriptProcessor.Clear();
+                    lock (_asrBufferLock) { _asrBuffer.Clear(); }
+                    continue;
+                }
+
+                // Semantic Slide Navigation
+                if (lowerTranscript.Contains("next slide"))
+                {
+                    _pptService.NextSlide();
+                    _transcriptProcessor.Clear();
+                    lock (_asrBufferLock) { _asrBuffer.Clear(); }
+                    continue;
+                }
+                if (lowerTranscript.Contains("previous slide"))
+                {
+                    _pptService.PreviousSlide();
+                    _transcriptProcessor.Clear();
+                    lock (_asrBufferLock) { _asrBuffer.Clear(); }
+                    continue;
+                }
+
+                if (!IsLaserEnabled)
+                    continue;
 
                 // 4. Check for meaningful change — skip if no new words
                 if (string.IsNullOrWhiteSpace(transcriptText))

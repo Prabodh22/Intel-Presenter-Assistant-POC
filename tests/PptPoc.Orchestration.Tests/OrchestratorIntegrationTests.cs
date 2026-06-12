@@ -191,8 +191,9 @@ public class OrchestratorIntegrationTests
         public int GetSlideIndexFromComObject(object slideComObject) => ActiveSlideIndex;
         public object? GetActiveSlideComObject() => _slide;
         public object? GetActivePresentationComObject() => new object();
-        public bool IsSlideShowRunning() => false;
-        public void Dispose() { }
+        public bool IsSlideShowRunning() => false;        public bool UpsertNotesSection(object slideComObject, string sectionTitle, string content) => true;
+        public void NextSlide() { }
+        public void PreviousSlide() { }        public void Dispose() { }
     }
 
     private sealed class FakeSlideReader : ISlideReader
@@ -204,6 +205,10 @@ public class OrchestratorIntegrationTests
         {
             _slides[index] = snapshot;
         }
+
+        public SlideSnapshot ExtractShapesSync(object slideComObject) => new SlideSnapshot { SlideIndex = 1, SlideId = "default" };
+        public (System.Collections.Generic.List<(ImageElement img, int shapeId, byte[] bytes)> images, byte[]? slideImage, string manifest) ExportImageBytes(SlideSnapshot snapshot, object shapeOrSlideObj) => (new(), null, string.Empty);
+        public Task RunApiEnrichmentAsync(SlideSnapshot snapshot, (System.Collections.Generic.List<(ImageElement img, int shapeId, byte[] bytes)> images, byte[]? slideImage, string manifest) payload, object slideComObject) => Task.CompletedTask;
 
         public SlideSnapshot ReadSlide(object slideComObject)
         {
@@ -310,6 +315,8 @@ public class OrchestratorIntegrationTests
             return string.Join(" ", _chunks.Select(c => c.Text));
         }
 
+        public string GetRecentTranscriptTextForDisplay(TimeSpan window) => GetRecentTranscriptText(window);
+
         public List<string> GetRecentKeywords(TimeSpan window)
         {
             return GetRecentTranscriptText(window)
@@ -346,6 +353,9 @@ public class OrchestratorIntegrationTests
                 }
             };
         }
+
+        public Task<List<MatchResult>> MatchAsync(string transcriptText, SlideSnapshot snapshot) => 
+            Task.FromResult(Match(transcriptText, snapshot));
     }
 
     private sealed class FakeRenderer : IHighlightRenderer

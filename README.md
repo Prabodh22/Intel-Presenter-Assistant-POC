@@ -148,6 +148,18 @@ PPT-text-Image-highlight-POC/
   - Short text elements (≤2 words) require fuzzy evidence, not just semantic similarity
   - Single OCR word image matches capped at 0.45 (prevents "accuracy" → image highlight)
   - Title penalty (-0.15) favors denser content elements
+
+### Phase 4 — Hands-Free Enhancements
+- **Voice Commands:** 
+  - Say `"laser on"` or `"laser off"` to toggle highlighting dynamically (or use the configurable Global Hotkey: `Ctrl+Shift+L`)
+  - Say `"next slide"` or `"previous slide"` to advance PowerPoint entirely hands-free!
+- **System Tray Agent:** Application runs silently in the background. Right-click the presentation icon in the tray to toggle.
+- **Visual Feedback Widget:** A tiny heads-up dot rests unobtrusively on screen:
+  - 🔵 **Cyan:** Listening to voice commands / waiting
+  - 🟢 **Green:** Laser Highlighting Active
+  - 🔴 **Red:** Laser Highlighting Disabled
+  - 🟡 **Yellow:** Processing / Initializing Knowledge Base
+- **Robust Configuration:** Fine-tune chunk settings, model paths, toggle keys, threshold confidences, and theme colors inside the included `appsettings.json`.
 - **Spatial Reasoning:** Bounding-box math resolves "the image on the left/right" without a vision model
 
 ### Phase 4 — Knowledge Base Preprocessing

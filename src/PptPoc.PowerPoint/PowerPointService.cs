@@ -203,6 +203,32 @@ public class PowerPointService : IPowerPointService
         return existing.TrimEnd() + "\r\n\r\n" + sectionText;
     }
 
+    public void NextSlide()
+    {
+        try
+        {
+            if (_app?.ActivePresentation != null && _app.SlideShowWindows.Count > 0)
+                _app.SlideShowWindows[1].View.Next();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to navigate to next slide");
+        }
+    }
+
+    public void PreviousSlide()
+    {
+        try
+        {
+            if (_app?.ActivePresentation != null && _app.SlideShowWindows.Count > 0)
+                _app.SlideShowWindows[1].View.Previous();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to navigate to previous slide");
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

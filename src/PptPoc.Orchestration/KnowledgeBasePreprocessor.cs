@@ -49,7 +49,17 @@ public class KnowledgeBasePreprocessor
 
         var presentation = (Microsoft.Office.Interop.PowerPoint.Presentation)presentationObj;
         int totalSlides = presentation.Slides.Count;
-        string pptName = System.IO.Path.GetFileName(presentation.FullName);
+        string pptFullName = presentation.FullName;
+        string pptName = System.IO.Path.GetFileName(pptFullName);
+        
+        string safeName = System.Text.RegularExpressions.Regex.Replace(pptFullName, "[^a-zA-Z0-9_.-]", "_");
+        outputPath = $"knowledge_base_{safeName}.yaml";
+
+        if (System.IO.File.Exists(outputPath))
+        {
+            Log.Information("Using cached YAML for {Presentation}: {Path}", pptName, outputPath);
+            return outputPath;
+        }
 
         Log.Information("Pre-processing {SlideCount} slides from {Presentation}", totalSlides, pptName);
 
@@ -85,7 +95,14 @@ public class KnowledgeBasePreprocessor
             {
                 try
                 {
-                    await _slideReader.RunApiEnrichmentAsync(snapshot, imageExports, slide);
+                    try
+                    {
+                        await _slideReader.RunApiEnrichmentAsync(snapshot, imageExports, slide);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "API enrichment (Vision/OCR) failed on slide {SlideIndex}. Degrading gracefully.", slideIdx);
+                    }
                     return (slideIdx, snapshot);
                 }
                 finally
