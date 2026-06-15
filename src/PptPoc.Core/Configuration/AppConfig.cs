@@ -27,4 +27,5 @@ public class AppConfig
     public string LogFilePath { get; set; } = "logs/pptpoc-.log";
     public int OrchestratorLoopMs { get; set; } = 100;
     public bool ForceCpuMode { get; set; } = false;
+    public bool SkipSemanticEmbeddings { get; set; } = false;
 }

@@ -13,4 +13,6 @@ public interface IPowerPointService : IDisposable
     object? GetActivePresentationComObject();
     bool IsSlideShowRunning();
     bool UpsertNotesSection(object slideComObject, string sectionTitle, string content);
+    bool RemoveNotesSection(object slideComObject, string sectionTitle);
+    int RemoveNotesSectionFromAllSlides(string sectionTitle);
 }

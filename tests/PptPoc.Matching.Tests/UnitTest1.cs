@@ -768,6 +768,376 @@ public class MatcherEngineTests
     }
 }
 
+public class MatcherEngineRagWakePhraseTests
+{
+    private sealed class RecordingRagAgent : IRAGAgent
+    {
+        public bool IsReady { get; set; } = true;
+        public List<string> RetrievalQueries { get; } = new();
+
+        public void Initialize(object kbLoader, SlideSnapshot currentSlideSnapshot, ISemanticEmbeddingService semanticService)
+        {
+        }
+
+        public Task<RAGContext> RetrieveContextAsync(string transcriptText, int topK = 5)
+        {
+            RetrievalQueries.Add(transcriptText);
+            var context = new RAGContext
+            {
+                ContextConfidenceBoost = 0.10,
+                RetrievedTexts = new List<TextElementWithScore>
+                {
+                    new()
+                    {
+                        ElementId = "kb-1",
+                        Text = transcriptText,
+                        SlideIndex = 1,
+                        SimilarityScore = 0.85
+                    }
+                }
+            };
+
+            return Task.FromResult(context);
+        }
+
+        public List<string> GetContextKeywords(int maxCount = 25) => new();
+
+        public MatchResult AugmentMatchConfidence(MatchResult matchResult, RAGContext context)
+        {
+            var boosted = matchResult;
+            boosted.Confidence = Math.Min(1.15, boosted.Confidence + context.ContextConfidenceBoost);
+            return boosted;
+        }
+
+        public void ClearContext()
+        {
+        }
+
+        public RAGContext? GetCachedContext() => null;
+    }
+
+    private static SlideSnapshot MakeWakeSnapshot()
+    {
+        var snapshot = new SlideSnapshot { SlideIndex = 33, SlideId = "s-33" };
+        snapshot.TextElements.Add(new TextElement
+        {
+            ElementId = "body-1",
+            ShapeName = "Content Placeholder 2",
+            RawText = "lm evaluation framework for intel cpu gpu npu industry benchmark datasets",
+            NormalizedText = "lm evaluation framework for intel cpu gpu npu industry benchmark datasets",
+            Words = new List<string> { "lm", "evaluation", "framework", "intel", "cpu", "gpu", "npu", "industry", "benchmark", "datasets" }
+        });
+        return snapshot;
+    }
+
+    [Fact]
+    public async Task WakePhrase_PositiveCases_TriggerRagWithoutLeak()
+    {
+        var snapshot = MakeWakeSnapshot();
+
+        var cases = new List<(string Input, string ExpectedQuery)>
+        {
+            ("hello assistant lm evaluation framework", "lm evaluation framework"),
+            ("hello assistant work on intel cpu gpu npu", "work on intel cpu gpu npu"),
+            ("hello assistant industry benchmark datasets", "industry benchmark datasets"),
+            ("hi assistant industry benchmark datasets", "industry benchmark datasets")
+        };
+
+        foreach (var c in cases)
+        {
+            var rag = new RecordingRagAgent();
+            var engine = new MatcherEngine(new AppConfig { MatchConfidenceThreshold = 0.1 }, new DummySemanticService(), rag);
+            var _ = await engine.MatchAsync(c.Input, snapshot);
+            Assert.Single(rag.RetrievalQueries);
+            Assert.Equal(c.ExpectedQuery, rag.RetrievalQueries[0]);
+        }
+    }
+
+    [Fact]
+    public async Task WakePhrase_NegativeCases_DoNotTriggerRag_LeakPrevented()
+    {
+        var rag = new RecordingRagAgent();
+        var engine = new MatcherEngine(new AppConfig { MatchConfidenceThreshold = 0.1 }, new DummySemanticService(), rag);
+        var snapshot = MakeWakeSnapshot();
+
+        var cases = new[]
+        {
+            "lm evaluation framework on intel gpu",
+            "can you explain industry benchmark datasets",
+            "quick question industry benchmark datasets",
+            "quick thought mmlu benchmark"
+        };
+
+        foreach (var input in cases)
+        {
+            rag.RetrievalQueries.Clear();
+            var _ = await engine.MatchAsync(input, snapshot);
+            Assert.Empty(rag.RetrievalQueries);
+        }
+    }
+
+    [Fact]
+    public async Task WakePhrase_EdgeCases_HandleVariantsAndGuardrails()
+    {
+        var rag = new RecordingRagAgent();
+        var engine = new MatcherEngine(new AppConfig { MatchConfidenceThreshold = 0.1 }, new DummySemanticService(), rag);
+        var snapshot = MakeWakeSnapshot();
+
+        rag.RetrievalQueries.Clear();
+        var _ = await engine.MatchAsync("Hello Assistant: mmlu pro", snapshot);
+        Assert.Single(rag.RetrievalQueries);
+        Assert.Equal("mmlu pro", rag.RetrievalQueries[0]);
+
+        rag.RetrievalQueries.Clear();
+        _ = await engine.MatchAsync("hello assistant   industry benchmark datasets   ", snapshot);
+        Assert.Single(rag.RetrievalQueries);
+        Assert.Equal("industry benchmark datasets", rag.RetrievalQueries[0]);
+
+        rag.RetrievalQueries.Clear();
+        _ = await engine.MatchAsync("hello assistant", snapshot);
+        Assert.Empty(rag.RetrievalQueries);
+    }
+}
+
+public class RAGAgentSlideWiseHelperTests
+{
+    private sealed class HelperOnlySemanticService : ISemanticEmbeddingService
+    {
+        public bool IsReady => true;
+
+        public Task InitializeAsync(string modelDir) => Task.CompletedTask;
+
+        public float[] GenerateEmbedding(string text)
+        {
+            string normalized = text.ToLowerInvariant();
+            return new float[]
+            {
+                normalized.Contains("mmlu", StringComparison.Ordinal) ? 1f : 0f,
+                normalized.Contains("benchmark", StringComparison.Ordinal) ? 1f : 0f,
+                normalized.Contains("npu", StringComparison.Ordinal) ? 1f : 0f,
+                normalized.Contains("audio", StringComparison.Ordinal) ? 1f : 0f,
+                normalized.Contains("driver", StringComparison.Ordinal) ? 1f : 0f
+            };
+        }
+
+        public double ComputeCosineSimilarity(float[] vectorA, float[] vectorB) => 0;
+    }
+
+    private sealed class ThrowingSemanticService : ISemanticEmbeddingService
+    {
+        public bool IsReady => false;
+
+        public Task InitializeAsync(string modelDir) => Task.CompletedTask;
+
+        public float[] GenerateEmbedding(string text)
+            => throw new InvalidOperationException("Embedding generation should not be called in skip mode.");
+
+        public double ComputeCosineSimilarity(float[] vectorA, float[] vectorB)
+            => throw new InvalidOperationException("Cosine similarity should not be called in skip mode.");
+    }
+
+    public sealed class FakeKbLoader
+    {
+        private readonly Dictionary<int, SlideSnapshot> _snapshots;
+
+        public FakeKbLoader(Dictionary<int, SlideSnapshot> snapshots)
+        {
+            _snapshots = snapshots;
+        }
+
+        public bool IsLoaded => true;
+        public int SlideCount => _snapshots.Count;
+        public SlideSnapshot? GetSnapshot(int slideIndex) => _snapshots.GetValueOrDefault(slideIndex);
+    }
+
+    [Fact]
+    public async Task RetrieveContextAsync_UsesOnlySlideWiseHelperText()
+    {
+        var slide1 = new SlideSnapshot
+        {
+            SlideIndex = 1,
+            SlideId = "slide-1",
+            RagHelper = new RagHelperSnapshot
+            {
+                TopicSummary = "MMLU Pro benchmark comparison on Intel NPU",
+                BusinessMeaning = "Supports hardware selection and benchmark trade-off decisions.",
+                RetrievalText = "mmlu pro benchmark intel npu throughput hardware selection tradeoff"
+            },
+            TextElements =
+            {
+                new TextElement
+                {
+                    ElementId = "s1-t1",
+                    RawText = "unrelated raw slide wording",
+                    NormalizedText = "unrelated raw slide wording",
+                    Words = new List<string> { "unrelated", "raw", "slide", "wording" }
+                }
+            }
+        };
+
+        var slide2 = new SlideSnapshot
+        {
+            SlideIndex = 2,
+            SlideId = "slide-2",
+            RagHelper = new RagHelperSnapshot
+            {
+                TopicSummary = "Audio driver troubleshooting",
+                BusinessMeaning = "Highlights recording stability issues.",
+                RetrievalText = "audio driver recording issue troubleshooting"
+            },
+            TextElements =
+            {
+                new TextElement
+                {
+                    ElementId = "s2-t1",
+                    RawText = "mmlu pro benchmark intel npu throughput",
+                    NormalizedText = "mmlu pro benchmark intel npu throughput",
+                    Words = new List<string> { "mmlu", "pro", "benchmark", "intel", "npu", "throughput" }
+                }
+            }
+        };
+
+        var kbLoader = new FakeKbLoader(new Dictionary<int, SlideSnapshot>
+        {
+            [1] = slide1,
+            [2] = slide2
+        });
+
+        var ragAgent = new RAGAgent(new AppConfig());
+        ragAgent.Initialize(kbLoader, slide1, new HelperOnlySemanticService());
+
+        var context = await ragAgent.RetrieveContextAsync("mmlu pro intel npu benchmark", topK: 1);
+
+        Assert.Single(context.RetrievedTexts);
+        Assert.Equal(1, context.RetrievedTexts[0].SlideIndex);
+        Assert.Contains("hardware selection", context.RetrievedTexts[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(context.RetrievedImages);
+    }
+
+    [Fact]
+    public async Task RetrieveContextAsync_NoOverlap_ReturnsEmpty()
+    {
+        var slide = new SlideSnapshot
+        {
+            SlideIndex = 1,
+            SlideId = "slide-1",
+            RagHelper = new RagHelperSnapshot
+            {
+                RetrievalText = "mmlu benchmark intel npu throughput"
+            }
+        };
+
+        var kbLoader = new FakeKbLoader(new Dictionary<int, SlideSnapshot> { [1] = slide });
+        var ragAgent = new RAGAgent(new AppConfig());
+        ragAgent.Initialize(kbLoader, slide, new HelperOnlySemanticService());
+
+        var context = await ragAgent.RetrieveContextAsync("audio driver troubleshooting", topK: 3);
+
+        Assert.Empty(context.RetrievedTexts);
+        Assert.Empty(context.RetrievedImages);
+    }
+
+    [Fact]
+    public async Task RetrieveContextAsync_PrefersDataSignal_WhenSimilarityTies()
+    {
+        var slide1 = new SlideSnapshot
+        {
+            SlideIndex = 1,
+            SlideId = "slide-1",
+            RagHelper = new RagHelperSnapshot
+            {
+                RetrievalText = "benchmark summary overview"
+            }
+        };
+
+        var slide2 = new SlideSnapshot
+        {
+            SlideIndex = 2,
+            SlideId = "slide-2",
+            RagHelper = new RagHelperSnapshot
+            {
+                RetrievalText = "benchmark | table | 42% | latency 150ms"
+            }
+        };
+
+        var kbLoader = new FakeKbLoader(new Dictionary<int, SlideSnapshot>
+        {
+            [1] = slide1,
+            [2] = slide2
+        });
+
+        var ragAgent = new RAGAgent(new AppConfig());
+        ragAgent.Initialize(kbLoader, slide1, new HelperOnlySemanticService());
+
+        var context = await ragAgent.RetrieveContextAsync("benchmark", topK: 2);
+
+        Assert.Equal(2, context.RetrievedTexts.Count);
+        Assert.Equal(2, context.RetrievedTexts[0].SlideIndex);
+        Assert.True(context.RetrievedTexts[0].SimilarityScore >= context.RetrievedTexts[1].SimilarityScore);
+    }
+
+    [Fact]
+    public async Task RetrieveContextAsync_SkipEmbeddings_UsesTextOverlapOnly()
+    {
+        var slide1 = new SlideSnapshot
+        {
+            SlideIndex = 1,
+            SlideId = "slide-1",
+            RagHelper = new RagHelperSnapshot
+            {
+                RetrievalText = "intel npu mmlu benchmark throughput"
+            }
+        };
+
+        var slide2 = new SlideSnapshot
+        {
+            SlideIndex = 2,
+            SlideId = "slide-2",
+            RagHelper = new RagHelperSnapshot
+            {
+                RetrievalText = "audio driver troubleshooting recording issue"
+            }
+        };
+
+        var kbLoader = new FakeKbLoader(new Dictionary<int, SlideSnapshot>
+        {
+            [1] = slide1,
+            [2] = slide2
+        });
+
+        var ragAgent = new RAGAgent(new AppConfig { SkipSemanticEmbeddings = true });
+        ragAgent.Initialize(kbLoader, slide1, new ThrowingSemanticService());
+
+        var context = await ragAgent.RetrieveContextAsync("mmlu benchmark on intel npu", topK: 1);
+
+        Assert.Single(context.RetrievedTexts);
+        Assert.Equal(1, context.RetrievedTexts[0].SlideIndex);
+        Assert.Contains("mmlu", context.RetrievedTexts[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RetrieveContextAsync_GenericOnlyTokens_DoNotRetrieve()
+    {
+        var slide = new SlideSnapshot
+        {
+            SlideIndex = 1,
+            SlideId = "slide-1",
+            RagHelper = new RagHelperSnapshot
+            {
+                RetrievalText = "test data result"
+            }
+        };
+
+        var kbLoader = new FakeKbLoader(new Dictionary<int, SlideSnapshot> { [1] = slide });
+        var ragAgent = new RAGAgent(new AppConfig { SkipSemanticEmbeddings = true });
+        ragAgent.Initialize(kbLoader, slide, new ThrowingSemanticService());
+
+        var context = await ragAgent.RetrieveContextAsync("test data", topK: 1);
+
+        Assert.Empty(context.RetrievedTexts);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  6. DebounceManager Tests
 // ═══════════════════════════════════════════════════════════════════

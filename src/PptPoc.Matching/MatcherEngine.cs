@@ -2,6 +2,7 @@ using PptPoc.Core.Configuration;
 using PptPoc.Core.Interfaces;
 using PptPoc.Core.Models;
 using Serilog;
+using System.Text.RegularExpressions;
 using MatchType = PptPoc.Core.Models.MatchType;
 
 namespace PptPoc.Matching;
@@ -9,13 +10,24 @@ namespace PptPoc.Matching;
 public class MatcherEngine : IMatcherEngine
 {
     private static readonly ILogger Log = Serilog.Log.ForContext<MatcherEngine>();
+    private const int RagRepeatCooldownMs = 3000;
+    private static readonly string[] RagWakePhrases =
+    {
+        "hello assistant",
+        "hi assistant"
+    };
 
     private readonly ConfidenceScorer _scorer;
+    private readonly AppConfig _config;
     private readonly ISemanticEmbeddingService _semanticService;
     private readonly IRAGAgent? _ragAgent;
+    private string _lastRagQueryKey = string.Empty;
+    private DateTime _lastRagQueryAtUtc = DateTime.MinValue;
+    private string _lastRagWindowKey = string.Empty;
 
     public MatcherEngine(AppConfig config, ISemanticEmbeddingService semanticService, IRAGAgent? ragAgent = null)
     {
+        _config = config;
         _scorer = new ConfidenceScorer(config);
         _semanticService = semanticService;
         _ragAgent = ragAgent;
@@ -30,7 +42,7 @@ public class MatcherEngine : IMatcherEngine
 
         // Semantic embedding for the transcript
         float[]? transcriptEmbedding = null;
-        if (_semanticService.IsReady)
+        if (!_config.SkipSemanticEmbeddings && _semanticService.IsReady)
         {
             transcriptEmbedding = _semanticService.GenerateEmbedding(transcriptText);
         }
@@ -39,7 +51,7 @@ public class MatcherEngine : IMatcherEngine
         foreach (var textElem in snapshot.TextElements)
         {
             // Pre-compute/cache embedding for slide text element if not present
-            if (_semanticService.IsReady && textElem.SemanticEmbedding == null && !string.IsNullOrWhiteSpace(textElem.NormalizedText))
+            if (!_config.SkipSemanticEmbeddings && _semanticService.IsReady && textElem.SemanticEmbedding == null && !string.IsNullOrWhiteSpace(textElem.NormalizedText))
             {
                 textElem.SemanticEmbedding = _semanticService.GenerateEmbedding(textElem.NormalizedText);
             }
@@ -174,8 +186,45 @@ public class MatcherEngine : IMatcherEngine
             
             if (_ragAgent.IsReady)
             {
-                Log.Debug("RAG: Starting context retrieval for text: {Text}", transcriptText);
-                var ragContext = await _ragAgent.RetrieveContextAsync(transcriptText, topK: 5);
+                var ragQuery = ExtractRagQueryAfterWakePhrase(transcriptText);
+                if (string.IsNullOrWhiteSpace(ragQuery))
+                {
+                    Log.Debug("RAG: Skipping retrieval because wake phrase is missing. Required phrase: {WakePhrases}", string.Join(" | ", RagWakePhrases));
+                    return results;
+                }
+
+                if (!LooksLikeMeaningfulTechBusinessQuery(ragQuery))
+                {
+                    Log.Debug("RAG: Skipping retrieval for non-meaningful transcript after wake phrase: {Text}", ragQuery);
+                    return results;
+                }
+
+                var normalizedQuery = NormalizeForRagKey(ragQuery);
+                var queryKey = $"{snapshot.SlideIndex}:{normalizedQuery}";
+
+                if (!string.IsNullOrWhiteSpace(normalizedQuery) &&
+                    string.Equals(_lastRagWindowKey, queryKey, StringComparison.Ordinal))
+                {
+                    Log.Debug("RAG: Skipping duplicate rolling window for query key {Key}", queryKey);
+                    return results;
+                }
+
+                _lastRagWindowKey = queryKey;
+
+                var nowUtc = DateTime.UtcNow;
+                if (!string.IsNullOrWhiteSpace(normalizedQuery)
+                    && string.Equals(_lastRagQueryKey, queryKey, StringComparison.Ordinal)
+                    && (nowUtc - _lastRagQueryAtUtc).TotalMilliseconds < RagRepeatCooldownMs)
+                {
+                    Log.Debug("RAG: Skipping repeated retrieval for query key {Key}", queryKey);
+                    return results;
+                }
+
+                _lastRagQueryKey = queryKey;
+                _lastRagQueryAtUtc = nowUtc;
+
+                Log.Debug("RAG: Starting context retrieval for text: {Text}", ragQuery);
+                var ragContext = await _ragAgent.RetrieveContextAsync(ragQuery, topK: 5);
                 
                 if (ragContext.HasContext)
                 {
@@ -217,4 +266,77 @@ public class MatcherEngine : IMatcherEngine
 
         return results;
     }
+
+    private static bool LooksLikeMeaningfulTechBusinessQuery(string transcript)
+    {
+        if (string.IsNullOrWhiteSpace(transcript))
+            return false;
+
+        var normalized = Regex.Replace(transcript.ToLowerInvariant(), "[^a-z0-9\\s]", " ");
+        var tokens = normalized
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(t => t.Length >= 3 && t.Any(char.IsLetter))
+            .ToList();
+
+        if (tokens.Count < 2)
+            return false;
+
+        var fillerOnly = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "yeah", "yes", "no", "ok", "okay", "well", "hmm", "hello", "hi", "thanks", "thank", "you",
+            "um", "umm", "uh", "huh", "like", "know", "dont", "don't", "think", "maybe", "mean", "course"
+        };
+
+        if (tokens.All(fillerOnly.Contains))
+            return false;
+
+        var businessTechHints = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "int4", "int8", "fp16", "fp32", "phi", "llm", "model", "benchmark", "latency", "throughput", "accuracy",
+            "openvino", "npu", "gpu", "cpu", "token", "quantization", "mmlu", "score", "business",
+            "cost", "kpi", "revenue", "margin", "forecast", "performance",
+            "lm", "evaluation", "framework", "dataset", "datasets", "industry", "intel"
+        };
+
+        return tokens.Any(t => businessTechHints.Contains(t));
+    }
+
+    private static string NormalizeForRagKey(string transcript)
+    {
+        if (string.IsNullOrWhiteSpace(transcript))
+            return string.Empty;
+
+        var normalized = Regex.Replace(transcript.ToLowerInvariant(), "[^a-z0-9\\s]", " ");
+        normalized = Regex.Replace(normalized, "\\s+", " ").Trim();
+        return normalized;
+    }
+
+    private static string ExtractRagQueryAfterWakePhrase(string transcript)
+    {
+        if (string.IsNullOrWhiteSpace(transcript))
+            return string.Empty;
+
+        var normalized = NormalizeForRagKey(transcript);
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+
+        foreach (var phrase in RagWakePhrases.OrderByDescending(p => p.Length))
+        {
+            var marker = NormalizeForRagKey(phrase);
+            int markerIndex = normalized.LastIndexOf(marker, StringComparison.Ordinal);
+            if (markerIndex < 0)
+                continue;
+
+            int queryStart = markerIndex + marker.Length;
+            if (queryStart >= normalized.Length)
+                return string.Empty;
+
+            var tail = normalized[queryStart..].Trim();
+            if (!string.IsNullOrWhiteSpace(tail))
+                return tail;
+        }
+
+        return string.Empty;
+    }
+
 }

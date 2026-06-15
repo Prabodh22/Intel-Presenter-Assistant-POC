@@ -2,6 +2,8 @@ using PptPoc.Core.Configuration;
 using PptPoc.Core.Interfaces;
 using PptPoc.Core.Models;
 using Serilog;
+using System.Text;
+using System.Text.RegularExpressions;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -14,6 +16,22 @@ namespace PptPoc.Orchestration;
 public class KnowledgeBasePreprocessor
 {
     private static readonly ILogger Log = Serilog.Log.ForContext<KnowledgeBasePreprocessor>();
+    private static readonly Regex MultiWhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
+    private static readonly Regex NumericTagRegex = new(@"\b\d+(?:\.\d+)?\s*(?:%|ms|s|x|fps|w|gb|mb|tb|m|k)?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly string[] KnownBenchmarks =
+    {
+        "mmlu pro", "mmlu", "gsm8k", "hellaswag", "arc", "truthfulqa", "bbh", "winogrande"
+    };
+    private static readonly Dictionary<string, string[]> AliasExpansions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["cpu"] = new[] { "central processing unit" },
+        ["gpu"] = new[] { "graphics processing unit" },
+        ["npu"] = new[] { "neural processing unit", "intel npu" },
+        ["llm"] = new[] { "large language model" },
+        ["rag"] = new[] { "retrieval augmented generation", "retrieval augmented" },
+        ["mmlu"] = new[] { "massive multitask language understanding" },
+        ["mmlu pro"] = new[] { "massive multitask language understanding pro" }
+    };
 
     private readonly ISlideReader _slideReader;
     private readonly ISemanticEmbeddingService _semanticService;
@@ -107,7 +125,7 @@ public class KnowledgeBasePreprocessor
             // Process text elements
             foreach (var txt in snapshot.TextElements)
             {
-                if (txt.SemanticEmbedding == null && _semanticService.IsReady
+                if (!_config.SkipSemanticEmbeddings && txt.SemanticEmbedding == null && _semanticService.IsReady
                     && !string.IsNullOrWhiteSpace(txt.NormalizedText))
                 {
                     txt.SemanticEmbedding = _semanticService.GenerateEmbedding(txt.NormalizedText);
@@ -134,7 +152,7 @@ public class KnowledgeBasePreprocessor
             foreach (var img in snapshot.ImageElements)
             {
                 // Compute embedding from best available source
-                if (img.SemanticEmbedding == null && _semanticService.IsReady)
+                if (!_config.SkipSemanticEmbeddings && img.SemanticEmbedding == null && _semanticService.IsReady)
                 {
                     string combinedOcrText = string.Join(" ", img.ExtractedWords.Select(w => w.Text));
                     string embedSource = !string.IsNullOrWhiteSpace(img.GptDescription)
@@ -166,6 +184,12 @@ public class KnowledgeBasePreprocessor
                 });
             }
 
+            slideKb.RagHelper = BuildRagHelper(snapshot);
+            if (!_config.SkipSemanticEmbeddings && _semanticService.IsReady && !string.IsNullOrWhiteSpace(slideKb.RagHelper.RetrievalText))
+            {
+                slideKb.RagHelper.Embedding = _semanticService.GenerateEmbedding(slideKb.RagHelper.RetrievalText);
+            }
+
             kb.Slides.Add(slideKb);
             Log.Information("Preprocessed slide {Current}/{Total}: {TextCount} text, {ImageCount} image elements",
                 index, totalSlides, snapshot.TextElements.Count, snapshot.ImageElements.Count);
@@ -184,5 +208,250 @@ public class KnowledgeBasePreprocessor
             outputPath, kb.Slides.Count, yaml.Length);
 
         return outputPath;
+    }
+
+    private static RagHelperKB BuildRagHelper(SlideSnapshot snapshot)
+    {
+        var orderedText = snapshot.TextElements
+            .OrderBy(t => t.Top)
+            .ThenBy(t => t.Left)
+            .Select(t => NormalizeWhitespace(t.RawText))
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var imageSignals = snapshot.ImageElements
+            .SelectMany(GetImageSignalParts)
+            .Select(NormalizeWhitespace)
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var topicSummary = BuildTopicSummary(orderedText, imageSignals);
+        var benchmarkTags = ExtractBenchmarkTags(orderedText, imageSignals);
+        var numericTags = ExtractNumericTags(orderedText, snapshot.ImageElements);
+        var canonicalTerms = ExtractCanonicalTerms(orderedText, imageSignals, benchmarkTags);
+        var aliasTerms = ExpandAliasTerms(canonicalTerms, benchmarkTags);
+        var keyDataPoints = ExtractKeyDataPoints(orderedText, imageSignals, benchmarkTags, numericTags);
+        var businessMeaning = BuildBusinessMeaning(canonicalTerms, benchmarkTags, numericTags);
+
+        var retrievalParts = new List<string>
+        {
+            topicSummary,
+            string.Join(" | ", keyDataPoints),
+            businessMeaning,
+            string.Join(' ', canonicalTerms),
+            string.Join(' ', aliasTerms),
+            string.Join(' ', benchmarkTags),
+            string.Join(' ', numericTags)
+        };
+
+        return new RagHelperKB
+        {
+            TopicSummary = topicSummary,
+            KeyDataPoints = keyDataPoints,
+            BusinessMeaning = businessMeaning,
+            CanonicalTerms = canonicalTerms,
+            AliasTerms = aliasTerms,
+            BenchmarkTags = benchmarkTags,
+            NumericTags = numericTags,
+            RetrievalText = NormalizeWhitespace(string.Join(" | ", retrievalParts.Where(p => !string.IsNullOrWhiteSpace(p))))
+        };
+    }
+
+    private static string BuildTopicSummary(List<string> orderedText, List<string> imageSignals)
+    {
+        var summaryParts = orderedText
+            .Where(t => CountWords(t) <= 18)
+            .Take(2)
+            .ToList();
+
+        if (summaryParts.Count == 0)
+            summaryParts = orderedText.Take(1).ToList();
+
+        if (summaryParts.Count == 0)
+            summaryParts = imageSignals.Take(1).ToList();
+
+        return NormalizeWhitespace(string.Join(". ", summaryParts));
+    }
+
+    private static List<string> ExtractKeyDataPoints(
+        List<string> orderedText,
+        List<string> imageSignals,
+        List<string> benchmarkTags,
+        List<string> numericTags)
+    {
+        var results = new List<string>();
+
+        foreach (var line in orderedText.Concat(imageSignals))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            bool containsNumber = NumericTagRegex.IsMatch(line);
+            bool containsBenchmark = benchmarkTags.Any(tag => line.Contains(tag, StringComparison.OrdinalIgnoreCase));
+            bool containsComparison = line.Contains(" vs ", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("faster", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("slower", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("latency", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("throughput", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("accuracy", StringComparison.OrdinalIgnoreCase);
+
+            if (containsNumber || containsBenchmark || containsComparison)
+            {
+                results.Add(line);
+            }
+        }
+
+        foreach (var tag in benchmarkTags)
+            results.Add(tag);
+        foreach (var tag in numericTags)
+            results.Add(tag);
+
+        return results
+            .Select(NormalizeWhitespace)
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(5)
+            .ToList();
+    }
+
+    private static List<string> ExtractCanonicalTerms(List<string> orderedText, List<string> imageSignals, List<string> benchmarkTags)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var token in Tokenize(string.Join(' ', orderedText.Concat(imageSignals).Concat(benchmarkTags))))
+        {
+            counts[token] = counts.TryGetValue(token, out var count) ? count + 1 : 1;
+        }
+
+        return counts
+            .OrderByDescending(kvp => kvp.Value)
+            .ThenBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kvp => kvp.Key)
+            .Take(12)
+            .ToList();
+    }
+
+    private static List<string> ExpandAliasTerms(List<string> canonicalTerms, List<string> benchmarkTags)
+    {
+        var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var term in canonicalTerms.Concat(benchmarkTags))
+        {
+            if (AliasExpansions.TryGetValue(term, out var expansions))
+            {
+                foreach (var expansion in expansions)
+                    aliases.Add(expansion);
+            }
+        }
+
+        return aliases.ToList();
+    }
+
+    private static List<string> ExtractBenchmarkTags(List<string> orderedText, List<string> imageSignals)
+    {
+        var combined = string.Join(' ', orderedText.Concat(imageSignals));
+        return KnownBenchmarks
+            .Where(tag => combined.Contains(tag, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static List<string> ExtractNumericTags(List<string> orderedText, List<ImageElement> images)
+    {
+        var numericTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (Match match in NumericTagRegex.Matches(string.Join(' ', orderedText)))
+        {
+            numericTags.Add(match.Value.Trim());
+        }
+
+        foreach (var fact in images.SelectMany(i => i.ChartNumericFacts))
+        {
+            foreach (Match match in NumericTagRegex.Matches(fact))
+                numericTags.Add(match.Value.Trim());
+        }
+
+        return numericTags.Take(8).ToList();
+    }
+
+    private static string BuildBusinessMeaning(List<string> canonicalTerms, List<string> benchmarkTags, List<string> numericTags)
+    {
+        var signals = new HashSet<string>(canonicalTerms.Concat(benchmarkTags), StringComparer.OrdinalIgnoreCase);
+        var phrases = new List<string>();
+
+        if (signals.Any(t => t.Contains("latency", StringComparison.OrdinalIgnoreCase)
+            || t.Contains("throughput", StringComparison.OrdinalIgnoreCase)
+            || t.Contains("performance", StringComparison.OrdinalIgnoreCase)))
+        {
+            phrases.Add("Highlights runtime efficiency and deployment responsiveness.");
+        }
+
+        if (signals.Any(t => t.Contains("accuracy", StringComparison.OrdinalIgnoreCase)
+            || t.Contains("benchmark", StringComparison.OrdinalIgnoreCase)) || benchmarkTags.Count > 0)
+        {
+            phrases.Add("Summarizes benchmark quality and comparative model performance.");
+        }
+
+        if (signals.Any(t => t.Equals("cpu", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("gpu", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("npu", StringComparison.OrdinalIgnoreCase)))
+        {
+            phrases.Add("Supports hardware selection and platform trade-off decisions.");
+        }
+
+        if (numericTags.Count > 0)
+        {
+            phrases.Add("Preserves measurable data points for business-facing discussion.");
+        }
+
+        if (phrases.Count == 0)
+            phrases.Add("Summarizes the slide's main message for fast business-oriented retrieval.");
+
+        return NormalizeWhitespace(string.Join(' ', phrases.Take(2)));
+    }
+
+    private static IEnumerable<string> GetImageSignalParts(ImageElement image)
+    {
+        if (!string.IsNullOrWhiteSpace(image.GptDescription))
+            yield return image.GptDescription;
+        if (!string.IsNullOrWhiteSpace(image.AltText))
+            yield return image.AltText;
+        if (!string.IsNullOrWhiteSpace(image.Title))
+            yield return image.Title;
+        if (!string.IsNullOrWhiteSpace(image.NearbyText))
+            yield return image.NearbyText;
+        foreach (var keyword in image.InferredKeywords)
+            yield return keyword;
+        foreach (var fact in image.ChartNumericFacts)
+            yield return fact;
+    }
+
+    private static IEnumerable<string> Tokenize(string text)
+    {
+        var stopwords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with", "by", "from", "is", "are"
+        };
+
+        foreach (var token in text
+            .Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '-', '_', '/', '\\', '|', '(', ')' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim().ToLowerInvariant()))
+        {
+            if ((token.Length >= 3 || AliasExpansions.ContainsKey(token)) && !stopwords.Contains(token) && token.Any(char.IsLetter))
+                yield return token;
+        }
+    }
+
+    private static string NormalizeWhitespace(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        return MultiWhitespaceRegex.Replace(text.Trim(), " ");
+    }
+
+    private static int CountWords(string text)
+    {
+        return text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
     }
 }

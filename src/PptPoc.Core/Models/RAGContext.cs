@@ -33,6 +33,7 @@ public class TextElementWithScore
     public string Text { get; set; } = "";
     public int SlideIndex { get; set; }
     public double SimilarityScore { get; set; } // 0.0 to 1.0
+    public double HybridRankScore { get; set; } // Default 0.0
     public float[]? Embedding { get; set; }
 }
 

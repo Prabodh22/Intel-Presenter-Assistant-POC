@@ -23,8 +23,41 @@ public class SlideKB
     [YamlMember(Alias = "index")]
     public int Index { get; set; }
 
+    [YamlMember(Alias = "rag_helper")]
+    public RagHelperKB? RagHelper { get; set; }
+
     [YamlMember(Alias = "elements")]
     public List<ElementKB> Elements { get; set; } = new();
+}
+
+public class RagHelperKB
+{
+    [YamlMember(Alias = "topic_summary")]
+    public string TopicSummary { get; set; } = string.Empty;
+
+    [YamlMember(Alias = "key_data_points")]
+    public List<string> KeyDataPoints { get; set; } = new();
+
+    [YamlMember(Alias = "business_meaning")]
+    public string BusinessMeaning { get; set; } = string.Empty;
+
+    [YamlMember(Alias = "canonical_terms")]
+    public List<string> CanonicalTerms { get; set; } = new();
+
+    [YamlMember(Alias = "alias_terms")]
+    public List<string> AliasTerms { get; set; } = new();
+
+    [YamlMember(Alias = "benchmark_tags")]
+    public List<string> BenchmarkTags { get; set; } = new();
+
+    [YamlMember(Alias = "numeric_tags")]
+    public List<string> NumericTags { get; set; } = new();
+
+    [YamlMember(Alias = "retrieval_text")]
+    public string RetrievalText { get; set; } = string.Empty;
+
+    [YamlMember(Alias = "embedding")]
+    public float[]? Embedding { get; set; }
 }
 
 public class ElementKB

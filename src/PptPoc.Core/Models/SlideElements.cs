@@ -38,6 +38,20 @@ public class SlideSnapshot
 {
     public int SlideIndex { get; set; }
     public string SlideId { get; set; } = string.Empty;
+    public RagHelperSnapshot? RagHelper { get; set; }
     public List<TextElement> TextElements { get; set; } = new();
     public List<ImageElement> ImageElements { get; set; } = new();
+}
+
+public class RagHelperSnapshot
+{
+    public string TopicSummary { get; set; } = string.Empty;
+    public List<string> KeyDataPoints { get; set; } = new();
+    public string BusinessMeaning { get; set; } = string.Empty;
+    public List<string> CanonicalTerms { get; set; } = new();
+    public List<string> AliasTerms { get; set; } = new();
+    public List<string> BenchmarkTags { get; set; } = new();
+    public List<string> NumericTags { get; set; } = new();
+    public string RetrievalText { get; set; } = string.Empty;
+    public float[]? Embedding { get; set; }
 }

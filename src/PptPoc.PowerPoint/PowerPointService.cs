@@ -153,6 +153,26 @@ public class PowerPointService : IPowerPointService
             string endMarker = $"[{sectionTitle} END]";
             string sectionText = $"{startMarker}\r\n{content}\r\n{endMarker}";
 
+            // Prefer the standard notes body placeholder to avoid writing into title/date/footer shapes.
+            try
+            {
+                var notesBody = notesPage.Shapes.Placeholders[2];
+                if (notesBody?.HasTextFrame == Office.MsoTriState.msoTrue)
+                {
+                    var bodyTextRange = notesBody.TextFrame?.TextRange;
+                    if (bodyTextRange != null)
+                    {
+                        var bodyExisting = bodyTextRange.Text ?? string.Empty;
+                        bodyTextRange.Text = UpsertSection(bodyExisting, sectionText, startMarker, endMarker);
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback below for templates that do not expose placeholder #2.
+            }
+
             foreach (Ppt.Shape shape in notesPage.Shapes)
             {
                 if (shape.HasTextFrame != Office.MsoTriState.msoTrue)
@@ -173,6 +193,142 @@ public class PowerPointService : IPowerPointService
         {
             Log.Warning(ex, "Failed to update notes section '{SectionTitle}'", sectionTitle);
             return false;
+        }
+    }
+
+    public bool RemoveNotesSection(object slideComObject, string sectionTitle)
+    {
+        try
+        {
+            var slide = (Ppt.Slide)slideComObject;
+            var notesPage = slide.NotesPage;
+            if (notesPage == null)
+                return false;
+
+            string startMarker = $"[{sectionTitle} START]";
+            string endMarker = $"[{sectionTitle} END]";
+
+            // Prefer the standard notes body placeholder so we only touch the actual notes text.
+            try
+            {
+                var notesBody = notesPage.Shapes.Placeholders[2];
+                if (notesBody?.HasTextFrame == Office.MsoTriState.msoTrue)
+                {
+                    var bodyTextRange = notesBody.TextFrame?.TextRange;
+                    if (bodyTextRange != null)
+                    {
+                        var existing = bodyTextRange.Text ?? string.Empty;
+                        bodyTextRange.Text = RemoveSection(existing, startMarker, endMarker);
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback below for templates that do not expose placeholder #2.
+            }
+
+            foreach (Ppt.Shape shape in notesPage.Shapes)
+            {
+                if (shape.HasTextFrame != Office.MsoTriState.msoTrue)
+                    continue;
+
+                var textRange = shape.TextFrame?.TextRange;
+                if (textRange == null)
+                    continue;
+
+                var existing = textRange.Text ?? string.Empty;
+                textRange.Text = RemoveSection(existing, startMarker, endMarker);
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to remove notes section '{SectionTitle}'", sectionTitle);
+            return false;
+        }
+    }
+
+    public int RemoveNotesSectionFromAllSlides(string sectionTitle)
+    {
+        try
+        {
+            if (_app == null)
+                return 0;
+
+            var presentation = _app.ActivePresentation;
+            if (presentation == null || presentation.Slides == null)
+                return 0;
+
+            int updatedCount = 0;
+            string startMarker = $"[{sectionTitle} START]";
+            string endMarker = $"[{sectionTitle} END]";
+
+            foreach (Ppt.Slide slide in presentation.Slides)
+            {
+                var notesPage = slide.NotesPage;
+                if (notesPage == null)
+                    continue;
+
+                bool updatedThisSlide = false;
+
+                try
+                {
+                    var notesBody = notesPage.Shapes.Placeholders[2];
+                    if (notesBody?.HasTextFrame == Office.MsoTriState.msoTrue)
+                    {
+                        var bodyTextRange = notesBody.TextFrame?.TextRange;
+                        if (bodyTextRange != null)
+                        {
+                            var existing = bodyTextRange.Text ?? string.Empty;
+                            var cleaned = RemoveSection(existing, startMarker, endMarker);
+                            if (!string.Equals(existing, cleaned, StringComparison.Ordinal))
+                            {
+                                bodyTextRange.Text = cleaned;
+                                updatedThisSlide = true;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Fallback below for templates without the standard notes placeholder.
+                }
+
+                if (!updatedThisSlide)
+                {
+                    foreach (Ppt.Shape shape in notesPage.Shapes)
+                    {
+                        if (shape.HasTextFrame != Office.MsoTriState.msoTrue)
+                            continue;
+
+                        var textRange = shape.TextFrame?.TextRange;
+                        if (textRange == null)
+                            continue;
+
+                        var existing = textRange.Text ?? string.Empty;
+                        var cleaned = RemoveSection(existing, startMarker, endMarker);
+                        if (string.Equals(existing, cleaned, StringComparison.Ordinal))
+                            continue;
+
+                        textRange.Text = cleaned;
+                        updatedThisSlide = true;
+                        break;
+                    }
+                }
+
+                if (updatedThisSlide)
+                    updatedCount++;
+            }
+
+            return updatedCount;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to remove notes section '{SectionTitle}' from all slides", sectionTitle);
+            return 0;
         }
     }
 
@@ -201,6 +357,30 @@ public class PowerPointService : IPowerPointService
             return sectionText;
 
         return existing.TrimEnd() + "\r\n\r\n" + sectionText;
+    }
+
+    private static string RemoveSection(string existing, string startMarker, string endMarker)
+    {
+        int startIdx = existing.IndexOf(startMarker, StringComparison.Ordinal);
+        if (startIdx < 0)
+            return existing;
+
+        int endIdx = existing.IndexOf(endMarker, startIdx, StringComparison.Ordinal);
+        if (endIdx < 0)
+            return existing;
+
+        int endExclusive = endIdx + endMarker.Length;
+        string before = existing[..startIdx].TrimEnd();
+        string after = existing[endExclusive..].TrimStart();
+
+        if (string.IsNullOrWhiteSpace(before) && string.IsNullOrWhiteSpace(after))
+            return string.Empty;
+        if (string.IsNullOrWhiteSpace(before))
+            return after;
+        if (string.IsNullOrWhiteSpace(after))
+            return before;
+
+        return before + "\r\n\r\n" + after;
     }
 
     public void Dispose()

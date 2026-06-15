@@ -38,7 +38,21 @@ public class KnowledgeBaseLoader
             var snapshot = new SlideSnapshot
             {
                 SlideIndex = slideKb.Index,
-                SlideId = $"slide_{slideKb.Index}"
+                SlideId = $"slide_{slideKb.Index}",
+                RagHelper = slideKb.RagHelper == null
+                    ? null
+                    : new RagHelperSnapshot
+                    {
+                        TopicSummary = slideKb.RagHelper.TopicSummary,
+                        KeyDataPoints = slideKb.RagHelper.KeyDataPoints ?? new List<string>(),
+                        BusinessMeaning = slideKb.RagHelper.BusinessMeaning,
+                        CanonicalTerms = slideKb.RagHelper.CanonicalTerms ?? new List<string>(),
+                        AliasTerms = slideKb.RagHelper.AliasTerms ?? new List<string>(),
+                        BenchmarkTags = slideKb.RagHelper.BenchmarkTags ?? new List<string>(),
+                        NumericTags = slideKb.RagHelper.NumericTags ?? new List<string>(),
+                        RetrievalText = slideKb.RagHelper.RetrievalText,
+                        Embedding = slideKb.RagHelper.Embedding
+                    }
             };
 
             foreach (var el in slideKb.Elements)

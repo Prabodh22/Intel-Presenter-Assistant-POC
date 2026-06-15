@@ -22,11 +22,14 @@ public class RAGAgent : IRAGAgent
     private RAGContext? _cachedContext;
     private string? _cachedTranscript;
 
+    // BM25 / Lexical state
+    private Dictionary<string, double> _idfMap = new(StringComparer.OrdinalIgnoreCase);
+    private double _averageDocumentLength = 0.0;
+
     public bool IsReady =>
         _kbLoader != null &&
         _kbLoader.IsLoaded == true &&
-        _semanticService != null &&
-        _semanticService.IsReady;
+        (_config.SkipSemanticEmbeddings || (_semanticService != null && _semanticService.IsReady));
 
     public RAGAgent(AppConfig config)
     {
@@ -49,6 +52,8 @@ public class RAGAgent : IRAGAgent
             _semanticService = semanticService;
             _cachedContext = null;
             _cachedTranscript = null;
+
+            BuildIdfMap();
 
             Log.Information("RAG Agent initialized with KB ({KbSize} slides) for slide {SlideIndex}",
                 _kbLoader.SlideCount, currentSlideSnapshot.SlideIndex);
@@ -80,21 +85,35 @@ public class RAGAgent : IRAGAgent
 
         try
         {
-            // Generate embedding for transcript
-            float[]? transcriptEmbedding = _semanticService!.GenerateEmbedding(transcriptText);
-            if (transcriptEmbedding == null)
+            float[]? transcriptEmbedding = null;
+            bool useSemanticSearch = !_config.SkipSemanticEmbeddings && _semanticService != null && _semanticService.IsReady;
+
+            // Generate embedding for transcript only in semantic mode.
+            if (useSemanticSearch)
             {
-                Log.Warning("Failed to generate embedding for transcript text");
-                return context;
+                transcriptEmbedding = _semanticService!.GenerateEmbedding(transcriptText);
+                if (transcriptEmbedding == null)
+                {
+                    Log.Warning("Failed to generate embedding for transcript text");
+                    return context;
+                }
             }
 
-            // Retrieve similar text elements from KB
-            var textMatches = RetrieveTextElements(transcriptText, transcriptEmbedding, topK);
+            // Retrieve similar helper sections from KB
+            var textMatches = RetrieveTextElements(transcriptText, transcriptEmbedding, topK, useSemanticSearch);
+            if (useSemanticSearch && textMatches.Count == 0)
+            {
+                // Fallback to lexical overlap when semantic scores are near-threshold but filtered out.
+                textMatches = RetrieveTextElements(transcriptText, transcriptEmbedding: null, topK, useSemanticSearch: false);
+                if (textMatches.Count > 0)
+                {
+                    Log.Debug("RAG text fallback: semantic returned no hits; lexical mode recovered {Count} matches", textMatches.Count);
+                }
+            }
             context.RetrievedTexts.AddRange(textMatches);
 
-            // Retrieve similar image elements from KB
-            var imageMatches = RetrieveImageElements(transcriptText, transcriptEmbedding, topK);
-            context.RetrievedImages.AddRange(imageMatches);
+            // Helper-only retrieval keeps the runtime path compact and avoids scanning raw image content.
+            var imageMatches = new List<ImageElementWithScore>();
 
             // Extract contextual keywords from retrieved elements
             context.ContextKeywords = ExtractContextKeywords(context, maxCount: 25);
@@ -165,7 +184,7 @@ public class RAGAgent : IRAGAgent
         return _cachedContext;
     }
 
-    private List<TextElementWithScore> RetrieveTextElements(string transcriptText, float[] transcriptEmbedding, int topK)
+    private List<TextElementWithScore> RetrieveTextElements(string transcriptText, float[]? transcriptEmbedding, int topK, bool useSemanticSearch)
     {
         var results = new List<TextElementWithScore>();
 
@@ -174,83 +193,134 @@ public class RAGAgent : IRAGAgent
 
         try
         {
-            var allMatches = new List<TextElementWithScore>();
-            var queryTokens = ExpandQueryTokens(ExtractSignificantTokens(transcriptText));
-            // Slightly relax threshold for broad technical queries to improve boundary recall.
-            double similarityThreshold = queryTokens.Count >= 3 ? 0.25 : 0.30;
+            var queryTokensSet = ExpandQueryTokens(ExtractSignificantTokens(transcriptText));
+            if (queryTokensSet.Count == 0 || queryTokensSet.All(IsGenericToken))
+                return results;
 
-            // KB slide indices are 1-based in this project.
+            string? benchmarkIntent = DetectBenchmarkIntent(queryTokensSet);
+            bool definitionStyleQuery = IsDefinitionStyleQuery(transcriptText);
+            
+            double similarityThreshold = useSemanticSearch
+                ? (queryTokensSet.Count >= 3 ? 0.25 : 0.30)
+                : (queryTokensSet.Count >= 3 ? 0.30 : 0.45);
+
+            var candidates = new List<(
+                int SlideIndex, 
+                string Text, 
+                float[]? Embedding, 
+                double SemanticScore, 
+                double Bm25Score, 
+                double DataSignal
+            )>();
+
             for (int slideIdx = 1; slideIdx <= _kbLoader.SlideCount; slideIdx++)
             {
                 var snapshot = _kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
-                if (snapshot == null)
+                if (snapshot?.RagHelper == null || string.IsNullOrWhiteSpace(snapshot.RagHelper.RetrievalText))
                     continue;
 
-                foreach (var textEl in snapshot.TextElements)
+                var helper = snapshot.RagHelper;
+                string textContent = helper.RetrievalText;
+                
+                // 1. BM25 Lexical Score
+                var docTokensList = ExtractTokensList(textContent);
+                docTokensList.AddRange(helper.CanonicalTerms.Concat(helper.AliasTerms)
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .SelectMany(ExtractTokensList));
+                
+                double bm25Base = ComputeBM25Score(queryTokensSet, docTokensList, _idfMap, _averageDocumentLength);
+                double bm25Final = ComputeRankScore(bm25Base, textContent, helper.TopicSummary, 
+                    helper.CanonicalTerms, queryTokensSet, benchmarkIntent, definitionStyleQuery);
+
+                // 2. Semantic Score
+                double semanticFinal = 0.0;
+                float[]? elEmbedding = null;
+
+                if (useSemanticSearch && transcriptEmbedding != null)
                 {
-                    string textContent = !string.IsNullOrWhiteSpace(textEl.NormalizedText)
-                        ? textEl.NormalizedText
-                        : textEl.RawText;
-
-                    if (string.IsNullOrWhiteSpace(textContent))
-                        continue;
-
-                    // Skip noise: single short tokens like "1", "a", "ok" score high on anything
-                    var wordCount = textContent.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
-                    if (wordCount == 1 && textContent.Length < 5)
-                        continue;
-
-                    if (IsMostlyNumericOrDateLike(textContent))
-                        continue;
-
-                    var candidateTokens = ExtractSignificantTokens(textContent);
-                    if (queryTokens.Count > 0 && candidateTokens.Count > 0)
+                    elEmbedding = helper.Embedding;
+                    if (elEmbedding == null || elEmbedding.Length == 0)
                     {
-                        int overlapCount = candidateTokens.Count(t => queryTokens.Contains(t));
-                        bool hasStrongOverlap = overlapCount >= 2;
-                        bool hasSingleSpecificOverlap = overlapCount == 1 &&
-                            candidateTokens.Any(t => queryTokens.Contains(t) && !IsGenericToken(t));
-
-                        if (!hasStrongOverlap && !hasSingleSpecificOverlap)
-                            continue;
+                        elEmbedding = _semanticService!.GenerateEmbedding(textContent);
                     }
-
-                    // Prefer pre-computed KB embeddings; fall back to runtime generation only if absent.
-                    float[] elEmbedding;
-                    if (textEl.SemanticEmbedding != null && textEl.SemanticEmbedding.Length > 0)
+                    
+                    if (elEmbedding != null && elEmbedding.Length > 0)
                     {
-                        elEmbedding = textEl.SemanticEmbedding;
+                        double semanticBase = CosineSimilarity(transcriptEmbedding, elEmbedding);
+                        semanticFinal = ComputeRankScore(semanticBase, textContent, helper.TopicSummary, 
+                            helper.CanonicalTerms, queryTokensSet, benchmarkIntent, definitionStyleQuery);
                     }
-                    else
-                    {
-                        var generated = _semanticService!.GenerateEmbedding(textContent);
-                        if (generated == null || generated.Length == 0) continue;
-                        elEmbedding = generated;
-                    }
+                }
 
-                    double similarity = CosineSimilarity(transcriptEmbedding, elEmbedding);
-                    allMatches.Add(new TextElementWithScore
-                    {
-                        ElementId = textEl.ElementId,
-                        Text = textContent,
-                        SlideIndex = slideIdx,
-                        SimilarityScore = similarity,
-                        Embedding = elEmbedding
-                    });
+                candidates.Add((
+                    slideIdx, 
+                    textContent, 
+                    elEmbedding, 
+                    semanticFinal, 
+                    bm25Final, 
+                    ComputeDataSignalScore(textContent)
+                ));
+            }
+
+            // Reciprocal Rank Fusion (RRF)
+            const int rrfK = 60;
+            
+            var semanticRanked = candidates
+                .OrderByDescending(c => c.SemanticScore)
+                .ThenByDescending(c => c.DataSignal)
+                .ThenBy(c => c.SlideIndex)
+                .ToList();
+            var bm25Ranked = candidates
+                .OrderByDescending(c => c.Bm25Score)
+                .ThenByDescending(c => c.DataSignal)
+                .ThenBy(c => c.SlideIndex)
+                .ToList();
+
+            var hybridScores = new Dictionary<int, double>();
+            for (int i = 0; i < semanticRanked.Count; i++)
+            {
+                var c = semanticRanked[i];
+                if (!hybridScores.ContainsKey(c.SlideIndex)) hybridScores[c.SlideIndex] = 0;
+                // Only fuse if it meets basic threshold, else it ranks 0 for semantic
+                if (c.SemanticScore >= similarityThreshold)
+                {
+                    hybridScores[c.SlideIndex] += 1.0 / (rrfK + i + 1);
                 }
             }
 
-            results = allMatches
-                .Where(m => m.SimilarityScore >= similarityThreshold)
-                .OrderByDescending(m => m.SimilarityScore)
+            for (int i = 0; i < bm25Ranked.Count; i++)
+            {
+                var c = bm25Ranked[i];
+                if (!hybridScores.ContainsKey(c.SlideIndex)) hybridScores[c.SlideIndex] = 0;
+                // Lexical threshold is typically BM25 > 0.0 but we'll use a small value
+                if (c.Bm25Score > 0.1)
+                {
+                    hybridScores[c.SlideIndex] += 1.0 / (rrfK + i + 1);
+                }
+            }
+
+            var allMatches = candidates
+                .Select(c => new TextElementWithScore
+                {
+                    ElementId = $"rag-helper-{c.SlideIndex}",
+                    Text = c.Text,
+                    SlideIndex = c.SlideIndex,
+                    Embedding = c.Embedding,
+                    SimilarityScore = useSemanticSearch ? c.SemanticScore : c.Bm25Score,
+                    HybridRankScore = hybridScores.TryGetValue(c.SlideIndex, out var score) ? score : 0.0
+                })
+                .Where(m => m.HybridRankScore > 0)
+                .OrderByDescending(m => m.HybridRankScore)
                 .ThenByDescending(m => ComputeDataSignalScore(m.Text))
                 .Take(topK)
                 .ToList();
 
-            if (results.Count == 0 && allMatches.Count > 0)
+            results = allMatches;
+
+            if (results.Count == 0 && candidates.Count > 0)
             {
-                Log.Debug("RAG text: no matches >= {Threshold:F2}; best available={Best:F3} (not returned)",
-                    similarityThreshold, allMatches.Max(m => m.SimilarityScore));
+                Log.Debug("RAG text: no matches passed threshold. Best semantic {BestSem:F2}, Best BM25 {BestBm25:F2}",
+                    candidates.Max(c => c.SemanticScore), candidates.Max(c => c.Bm25Score));
             }
         }
         catch (Exception ex)
@@ -263,98 +333,136 @@ public class RAGAgent : IRAGAgent
 
     private List<ImageElementWithScore> RetrieveImageElements(string transcriptText, float[] transcriptEmbedding, int topK)
     {
-        var results = new List<ImageElementWithScore>();
-
-        if (_kbLoader == null || !_kbLoader.IsLoaded)
-            return results;
-
-        try
-        {
-            var allMatches = new List<ImageElementWithScore>();
-            var queryTokens = ExpandQueryTokens(ExtractSignificantTokens(transcriptText));
-            // Image descriptions are noisier; use a lower boundary threshold for broader queries.
-            double similarityThreshold = queryTokens.Count >= 3 ? 0.20 : 0.25;
-
-            // KB slide indices are 1-based in this project.
-            for (int slideIdx = 1; slideIdx <= _kbLoader.SlideCount; slideIdx++)
-            {
-                var snapshot = _kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
-                if (snapshot == null)
-                    continue;
-
-                foreach (var imgEl in snapshot.ImageElements)
-                {
-                    string description = BuildImageDescription(imgEl);
-                    if (string.IsNullOrWhiteSpace(description))
-                        continue;
-
-                    var candidateTokens = ExtractSignificantTokens(description);
-                    if (queryTokens.Count > 0 && candidateTokens.Count > 0)
-                    {
-                        int overlapCount = candidateTokens.Count(t => queryTokens.Contains(t));
-                        bool hasStrongOverlap = overlapCount >= 2;
-                        bool hasSingleSpecificOverlap = overlapCount == 1 &&
-                            candidateTokens.Any(t => queryTokens.Contains(t) && !IsGenericToken(t));
-
-                        if (!hasStrongOverlap && !hasSingleSpecificOverlap)
-                            continue;
-                    }
-
-                    float[] descEmbedding;
-                    if (imgEl.SemanticEmbedding != null && imgEl.SemanticEmbedding.Length > 0)
-                    {
-                        descEmbedding = imgEl.SemanticEmbedding;
-                    }
-                    else
-                    {
-                        var generated = _semanticService!.GenerateEmbedding(description);
-                        if (generated == null || generated.Length == 0) continue;
-                        descEmbedding = generated;
-                    }
-
-                    double similarity = CosineSimilarity(transcriptEmbedding, descEmbedding);
-                    allMatches.Add(new ImageElementWithScore
-                    {
-                        ElementId = imgEl.ElementId,
-                        Description = description,
-                        SlideIndex = slideIdx,
-                        SimilarityScore = similarity,
-                        Embedding = descEmbedding
-                    });
-                }
-            }
-
-            results = allMatches
-                .Where(m => m.SimilarityScore >= similarityThreshold)
-                .OrderByDescending(m => m.SimilarityScore)
-                .ThenByDescending(m => ComputeDataSignalScore(m.Description))
-                .Take(topK)
-                .ToList();
-
-            if (results.Count == 0 && allMatches.Count > 0)
-            {
-                Log.Debug("RAG image: no matches >= {Threshold:F2}; best available={Best:F3} (not returned)",
-                    similarityThreshold, allMatches.Max(m => m.SimilarityScore));
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Error retrieving image elements");
-        }
-
-        return results;
+        return new List<ImageElementWithScore>();
     }
 
-    private static HashSet<string> ExtractSignificantTokens(string text)
+    private void BuildIdfMap()
     {
+        _idfMap.Clear();
+        _averageDocumentLength = 0;
+
+        if (_kbLoader == null || !_kbLoader.IsLoaded) return;
+
+        int numDocs = 0;
+        int totalTokens = 0;
+        var docFreqs = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        for (int slideIdx = 1; slideIdx <= _kbLoader.SlideCount; slideIdx++)
+        {
+            var snapshot = _kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
+            var helper = snapshot?.RagHelper;
+            if (helper == null || string.IsNullOrWhiteSpace(helper.RetrievalText)) continue;
+
+            numDocs++;
+
+            var helperTerms = helper.CanonicalTerms
+                .Concat(helper.AliasTerms)
+                .Concat(helper.BenchmarkTags)
+                .Concat(helper.NumericTags)
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .SelectMany(ExtractSignificantTokens)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var docTokens = ExtractSignificantTokens(helper.RetrievalText);
+            docTokens.UnionWith(helperTerms);
+
+            totalTokens += docTokens.Count;
+
+            foreach (var token in docTokens)
+            {
+                if (!docFreqs.ContainsKey(token))
+                    docFreqs[token] = 0;
+                docFreqs[token]++;
+            }
+        }
+
+        if (numDocs > 0)
+        {
+            _averageDocumentLength = (double)totalTokens / Math.Max(1, numDocs);
+
+            foreach (var kvp in docFreqs)
+            {
+                // BM25 IDF: log( (N - n + 0.5) / (n + 0.5) + 1 )
+                double n = kvp.Value;
+                // Add minimum floor to IDF to avoid zero weights
+                double idf = Math.Log((numDocs - n + 0.5) / (n + 0.5) + 1.0);
+                _idfMap[kvp.Key] = Math.Max(idf, 0.01);
+            }
+        }
+    }
+
+    private static double ComputeBM25Score(
+        HashSet<string> queryTokens,
+        List<string> candidateTokens,
+        Dictionary<string, double> idfMap,
+        double avgDocLength)
+    {
+        if (queryTokens.Count == 0 || candidateTokens.Count == 0 || idfMap.Count == 0 || avgDocLength == 0)
+            return 0.0;
+
+        double k1 = 1.5;
+        double b = 0.75;
+        double docLength = candidateTokens.Count;
+        double score = 0.0;
+
+        var termFrequencies = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var token in candidateTokens)
+        {
+            if (!termFrequencies.ContainsKey(token)) termFrequencies[token] = 0;
+            termFrequencies[token]++;
+        }
+
+        foreach (var q in queryTokens)
+        {
+            if (termFrequencies.TryGetValue(q, out int tf))
+            {
+                if (idfMap.TryGetValue(q, out var idf))
+                {
+                    double numerator = tf * (k1 + 1);
+                    double denominator = tf + k1 * (1 - b + b * (docLength / avgDocLength));
+                    score += idf * (numerator / denominator);
+                }
+            }
+        }
+
+        return score;
+    }
+
+    private static List<string> ExtractTokensList(string text)
+    {
+        text = CanonicalizeBenchmarkTerms(text);
+
         var shortDomainTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "ai", "ml", "llm", "rag"
+            "ai", "ml", "llm", "rag", "ceval", "mmlu", "gsm8k", "arc"
         };
 
         var stopwords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with", "by", "from", "is", "are"
+            "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with", "by", "from", "is", "are",
+            "tell", "about", "what", "me", "please", "show", "give", "explain", "can", "could", "would"
+        };
+
+        return text
+            .Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '-', '_', '/', '\\', '|', '(', ')' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim().ToLowerInvariant())
+            .Where(t => (t.Length >= 4 || shortDomainTokens.Contains(t)) && !stopwords.Contains(t) && t.Any(char.IsLetter))
+            .ToList();
+    }
+
+    private static HashSet<string> ExtractSignificantTokens(string text)
+    {
+        text = CanonicalizeBenchmarkTerms(text);
+
+        var shortDomainTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "ai", "ml", "llm", "rag", "ceval", "mmlu", "gsm8k", "arc"
+        };
+
+        var stopwords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with", "by", "from", "is", "are",
+            "tell", "about", "what", "me", "please", "show", "give", "explain", "can", "could", "would"
         };
 
         return text
@@ -362,6 +470,113 @@ public class RAGAgent : IRAGAgent
             .Select(t => t.Trim().ToLowerInvariant())
             .Where(t => (t.Length >= 4 || shortDomainTokens.Contains(t)) && !stopwords.Contains(t) && t.Any(char.IsLetter))
             .ToHashSet();
+    }
+
+    private static string CanonicalizeBenchmarkTerms(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        string normalized = Regex.Replace(text, @"\bc\s*[-_]?\s*eval\b", "ceval", RegexOptions.IgnoreCase);
+        normalized = Regex.Replace(normalized, @"\bmmlu\s*[-_]?\s*pro\b", "mmlupro", RegexOptions.IgnoreCase);
+        normalized = Regex.Replace(normalized, @"\bgsm\s*[-_]?\s*8k\b", "gsm8k", RegexOptions.IgnoreCase);
+        return normalized;
+    }
+
+    private static string? DetectBenchmarkIntent(HashSet<string> queryTokens)
+    {
+        string[] knownBenchmarks = { "ceval", "mmlu", "mmlupro", "gsm8k", "lambada", "arc", "hellaswag" };
+        return knownBenchmarks.FirstOrDefault(queryTokens.Contains);
+    }
+
+    private static bool IsDefinitionStyleQuery(string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return false;
+
+        string normalized = query.ToLowerInvariant();
+        return normalized.Contains("tell me about", StringComparison.Ordinal) ||
+               normalized.Contains("what is", StringComparison.Ordinal) ||
+               normalized.Contains("what's", StringComparison.Ordinal) ||
+               normalized.Contains("explain", StringComparison.Ordinal) ||
+               normalized.Contains("overview", StringComparison.Ordinal);
+    }
+
+    private static double ComputeRankScore(
+        double similarity,
+        string content,
+        string topicSummary,
+        List<string> canonicalTerms,
+        HashSet<string> queryTokens,
+        string? benchmarkIntent,
+        bool definitionStyleQuery)
+    {
+        double score = similarity;
+        string normalizedContent = content.ToLowerInvariant();
+        string normalizedTopic = topicSummary?.ToLowerInvariant() ?? string.Empty;
+
+        if (!string.IsNullOrWhiteSpace(benchmarkIntent))
+        {
+            string canonicalIntent = NormalizeBenchmarkLabel(benchmarkIntent);
+            bool topicMatches = NormalizeBenchmarkLabel(normalizedTopic) == canonicalIntent;
+            bool termsMatch = canonicalTerms.Any(t => NormalizeBenchmarkLabel(t) == canonicalIntent);
+
+            if (topicMatches)
+                score += 0.28;
+            if (termsMatch)
+                score += 0.16;
+            if (normalizedContent.Contains(canonicalIntent, StringComparison.OrdinalIgnoreCase))
+                score += 0.05;
+        }
+
+        if (definitionStyleQuery)
+        {
+            bool commandHeavy = normalizedContent.Contains("lm-eval --", StringComparison.OrdinalIgnoreCase)
+                || normalizedContent.Contains("lm_eval --", StringComparison.OrdinalIgnoreCase)
+                || normalizedContent.Contains("pip install", StringComparison.OrdinalIgnoreCase)
+                || normalizedContent.Contains("git clone", StringComparison.OrdinalIgnoreCase)
+                || normalizedContent.Contains("--model_args", StringComparison.OrdinalIgnoreCase);
+
+            bool definitionLike = normalizedContent.Contains("is a comprehensive", StringComparison.OrdinalIgnoreCase)
+                || normalizedContent.Contains("evaluation suite", StringComparison.OrdinalIgnoreCase)
+                || normalizedContent.Contains("consists of", StringComparison.OrdinalIgnoreCase);
+
+            if (definitionLike)
+                score += 0.12;
+            if (commandHeavy)
+                score -= 0.22;
+        }
+
+        if (queryTokens.Count > 0)
+        {
+            var contentTokens = ExtractSignificantTokens(content);
+            int overlap = queryTokens.Count(contentTokens.Contains);
+            if (overlap > 0)
+                score += Math.Min(0.12, overlap * 0.03);
+        }
+
+        return score;
+    }
+
+    private static string NormalizeBenchmarkLabel(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        string normalized = Regex.Replace(text.ToLowerInvariant(), @"[^a-z0-9]", string.Empty);
+        if (normalized is "ceval" or "mmlupro" or "gsm8k")
+            return normalized;
+
+        if (normalized.Contains("ceval", StringComparison.Ordinal))
+            return "ceval";
+        if (normalized.Contains("mmlupro", StringComparison.Ordinal))
+            return "mmlupro";
+        if (normalized.Contains("mmlu", StringComparison.Ordinal))
+            return "mmlu";
+        if (normalized.Contains("gsm8k", StringComparison.Ordinal))
+            return "gsm8k";
+
+        return normalized;
     }
 
     private static bool IsGenericToken(string token)
@@ -385,6 +600,9 @@ public class RAGAgent : IRAGAgent
             ["ml"] = new[] { "ai", "model" },
             ["rag"] = new[] { "retrieval", "search", "index" },
             ["llm"] = new[] { "ai", "agent" },
+            ["eval"] = new[] { "ceval", "evaluation", "benchmark" },
+            ["c-eval"] = new[] { "ceval", "evaluation" },
+            ["ceval"] = new[] { "c-eval", "evaluation" },
             ["inference"] = new[] { "latency", "speed", "performance" },
             ["benchmark"] = new[] { "speedup", "faster", "performance" },
             ["pipeline"] = new[] { "flow", "implementation" },
@@ -506,27 +724,10 @@ public class RAGAgent : IRAGAgent
 
     private static double CosineSimilarity(float[] a, float[] b)
     {
-        if (a.Length != b.Length)
+        if (a == null || b == null || a.Length == 0 || a.Length != b.Length)
             return 0.0;
-
-        double dotProduct = 0.0;
-        double magnitudeA = 0.0;
-        double magnitudeB = 0.0;
-
-        for (int i = 0; i < a.Length; i++)
-        {
-            dotProduct += a[i] * b[i];
-            magnitudeA += a[i] * a[i];
-            magnitudeB += b[i] * b[i];
-        }
-
-        magnitudeA = Math.Sqrt(magnitudeA);
-        magnitudeB = Math.Sqrt(magnitudeB);
-
-        if (magnitudeA == 0 || magnitudeB == 0)
-            return 0.0;
-
-        return dotProduct / (magnitudeA * magnitudeB);
+        
+        return System.Numerics.Tensors.TensorPrimitives.CosineSimilarity(a, b);
     }
 
     // Tie-breaker: prefer candidates that look like measurable data/table content when similarity is equal.

@@ -49,7 +49,10 @@ public class DebounceManager
             _recentWinners.Dequeue();
         }
 
-        int requiredCycles = _config.StabilityRequiredCycles;
+        int baseCycles = Math.Max(1, _config.StabilityRequiredCycles);
+        int requiredCycles = matchType == PptPoc.Core.Models.MatchType.ImageMatch
+            ? Math.Max(2, baseCycles * 2)
+            : baseCycles;
 
         int votes = _recentWinners.Count(x => x == elementId);
         if (votes < requiredCycles)
