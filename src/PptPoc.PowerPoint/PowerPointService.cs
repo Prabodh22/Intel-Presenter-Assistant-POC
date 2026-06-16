@@ -60,6 +60,14 @@ public class PowerPointService : IPowerPointService
         IntPtr pvReserved,
         [MarshalAs(UnmanagedType.IUnknown)] out object ppunk);
 
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    private const int SW_SHOWNORMAL = 1;
+
     public int GetActiveSlideIndex()
     {
         try
@@ -208,7 +216,10 @@ public class PowerPointService : IPowerPointService
         try
         {
             if (_app?.ActivePresentation != null && _app.SlideShowWindows.Count > 0)
+            {
                 _app.SlideShowWindows[1].View.Next();
+                RestoreSlideShowWindowFocus();
+            }
         }
         catch (Exception ex)
         {
@@ -221,11 +232,35 @@ public class PowerPointService : IPowerPointService
         try
         {
             if (_app?.ActivePresentation != null && _app.SlideShowWindows.Count > 0)
+            {
                 _app.SlideShowWindows[1].View.Previous();
+                RestoreSlideShowWindowFocus();
+            }
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "Failed to navigate to previous slide");
+        }
+    }
+
+    private void RestoreSlideShowWindowFocus()
+    {
+        try
+        {
+            if (_app == null || _app.SlideShowWindows.Count == 0)
+                return;
+
+            var slideShowWindow = _app.SlideShowWindows[1];
+            IntPtr hwnd = new(slideShowWindow.HWND);
+            if (hwnd == IntPtr.Zero)
+                return;
+
+            ShowWindow(hwnd, SW_SHOWNORMAL);
+            SetForegroundWindow(hwnd);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Unable to explicitly restore slideshow focus after voice navigation");
         }
     }
 

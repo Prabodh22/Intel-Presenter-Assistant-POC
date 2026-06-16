@@ -49,6 +49,8 @@ public class Orchestrator : IOrchestrator
     // Grace period: suppress highlights for N ms after a slide change
     private DateTime _slideChangedAt = DateTime.MinValue;
     private const int SlideChangeGraceMs = 1500;
+    private DateTime _lastNavigationCommandAt = DateTime.MinValue;
+    private const int NavigationCommandCooldownMs = 1500;
 
     // Incremental ASR gate: only transcribe when enough new samples arrived.
     private long _samplesReceivedTotal;
@@ -62,6 +64,19 @@ public class Orchestrator : IOrchestrator
     private int _lastNotesSlideIndex = -1;
     private string? _lastDemoQueryForSlide;
     private const double PresenterNotesMinScore = 0.35;
+    private static readonly Regex DirectNavigationRegex = new(
+        @"^\s*(?:please\s+)?(?:(?:go|move|switch|jump|take|show)\s+(?:to\s+)?)?(?<dir>next|previous|prev|back)\s+slide(?:\s+please)?\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly string[] NavigationContextPhrases =
+    {
+        "as we saw in previous slide",
+        "as we saw on previous slide",
+        "in the previous slide",
+        "on the previous slide",
+        "from the previous slide",
+        "from previous slide"
+    };
 
     public bool IsRunning => _cts != null && !_cts.IsCancellationRequested;
 
@@ -362,17 +377,24 @@ public class Orchestrator : IOrchestrator
                     continue;
                 }
 
-                // Semantic Slide Navigation
-                if (lowerTranscript.Contains("next slide"))
+                // Explicit slide navigation command handling with cooldown to avoid accidental repeats.
+                if (TryGetSlideNavigationCommand(transcriptText, out bool moveNext))
                 {
-                    _pptService.NextSlide();
-                    _transcriptProcessor.Clear();
-                    lock (_asrBufferLock) { _asrBuffer.Clear(); }
-                    continue;
-                }
-                if (lowerTranscript.Contains("previous slide"))
-                {
-                    _pptService.PreviousSlide();
+                    var nowUtc = DateTime.UtcNow;
+                    if ((nowUtc - _lastNavigationCommandAt).TotalMilliseconds < NavigationCommandCooldownMs)
+                    {
+                        Log.Debug("Navigation command ignored due to cooldown window");
+                        _transcriptProcessor.Clear();
+                        lock (_asrBufferLock) { _asrBuffer.Clear(); }
+                        continue;
+                    }
+
+                    if (moveNext)
+                        _pptService.NextSlide();
+                    else
+                        _pptService.PreviousSlide();
+
+                    _lastNavigationCommandAt = nowUtc;
                     _transcriptProcessor.Clear();
                     lock (_asrBufferLock) { _asrBuffer.Clear(); }
                     continue;
@@ -724,6 +746,48 @@ public class Orchestrator : IOrchestrator
             .Split(new[] { '\r', '\n', '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries))
             .Trim()
             .ToLowerInvariant();
+    }
+
+    private static bool TryGetSlideNavigationCommand(string? transcript, out bool moveNext)
+    {
+        moveNext = false;
+        if (string.IsNullOrWhiteSpace(transcript))
+            return false;
+
+        var normalized = NormalizeCompact(transcript);
+        if (NavigationContextPhrases.Any(phrase => normalized.Contains(phrase, StringComparison.Ordinal)))
+            return false;
+
+        // Check the full transcript first.
+        var direct = DirectNavigationRegex.Match(normalized);
+        if (direct.Success)
+        {
+            moveNext = IsNextDirection(direct.Groups["dir"].Value);
+            return true;
+        }
+
+        // Fall back to clause-level check so short imperative tails still work.
+        var segments = normalized
+            .Split(new[] { ".", ",", ";", " then ", " and then ", " and ", " but ", " so " }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(s => s.Length > 0)
+            .ToArray();
+
+        for (int i = segments.Length - 1; i >= 0; i--)
+        {
+            var match = DirectNavigationRegex.Match(segments[i]);
+            if (!match.Success)
+                continue;
+
+            moveNext = IsNextDirection(match.Groups["dir"].Value);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsNextDirection(string direction)
+    {
+        return direction.Equals("next", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildSpeakerLine(string content)
