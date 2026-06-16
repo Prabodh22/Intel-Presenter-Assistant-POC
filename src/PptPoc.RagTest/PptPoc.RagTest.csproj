@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../PptPoc.Core/PptPoc.Core.csproj" />
+    <ProjectReference Include="../PptPoc.Matching/PptPoc.Matching.csproj" />
+    <ProjectReference Include="../PptPoc.Orchestration/PptPoc.Orchestration.csproj" />
+    <ProjectReference Include="../PptPoc.PowerPoint/PptPoc.PowerPoint.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Serilog" Version="4.2.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.1.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="5.1.0" />
+  </ItemGroup>
+
+</Project>

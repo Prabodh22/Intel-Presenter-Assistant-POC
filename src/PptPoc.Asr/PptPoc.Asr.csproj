@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PptPoc.Core\PptPoc.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- OpenVINO C# API - loads from system OpenVINO in PATH (version agnostic) -->
+    <PackageReference Include="Sdcb.OpenVINO" Version="0.7.0" />
+    <PackageReference Include="Sdcb.OpenVINO.runtime.win-x64" Version="2025.2.0.1" />
+    <PackageReference Include="Serilog" Version="4.2.*" />
+    <PackageReference Include="System.Text.Json" Version="9.*" />
+  </ItemGroup>
+
+</Project>
