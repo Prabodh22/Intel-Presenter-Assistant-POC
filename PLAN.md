@@ -496,3 +496,199 @@ Appended two new test classes:
 
 > Build is still blocked by NuGet proxy auth (xunit/test-sdk not cached).
 > All 237 tests verified correct via static analysis (signature + logic review).
+
+
+---
+
+## Session Log — 2026-06-19  (Defender restart session)
+
+> **Last updated:** 2026-06-19
+
+### Quick status update
+
+| Area | Status |
+|---|---|
+| ASR efficiency analysis (Parakeet v2 burst / GPU) | ✅ Analysed — no action needed |
+| Bug #14 — Fix#6 chain walk dangling pointer | 🔲 NEW — identified in logs, fix ready |
+| Voice slide navigation | ✅ Logic EXISTS in code |
+| Voice laser on/off | ✅ Logic EXISTS in code |
+
+---
+
+### Bug #14 — Fix#6 `GetRecentTranscriptText` chain walk never terminates during continuous speech
+
+**File:** `src/PptPoc.Asr/TranscriptProcessor.cs` — `GetRecentTranscriptText()`
+**Severity:** 🟠 HIGH
+
+**Root cause:**
+The Fix#6 backward-chain extension uses a walking anchor (`chainAnchor` moves backward with
+every chained chunk). Because ASR fires every ~150–300ms, the gap between every consecutive
+pair is always ~0.15–0.8s — well below `UtteranceChainGapSeconds = 2.0`. The loop therefore
+**never hits the `break`** and chains every single chunk in the 3s–6s `beforeWindow` zone.
+
+**Effect:**
+During continuous speech, the effective matching window is always **6s** (2× the configured
+`TranscriptWindowSeconds = 3`), not 3s. Words spoken 4–6 seconds ago permanently contaminate
+the match input for the current slide context.
+
+Observed in logs (`pptpoc-20260618.log` ~15:32):
+```
+15:32:43.712  Fix#6: Extended → 1 chained chunk  (10:02:40.543)
+15:32:44.028  Fix#6: Extended → 2 chained chunks
+15:32:44.782  Fix#6: Extended → 3 chained chunks
+15:32:45.423  Fix#6: Extended → 5 chained chunks
+15:32:46.555  Fix#6: Extended → 6 chained chunks
+15:32:47.542  Fix#6: Extended → 7 chained chunks (oldest: 10:02:41.599, 6s ago)
+```
+
+**Fix — use a FIXED anchor (not a walking one):**
+
+Replace the `foreach` body in `GetRecentTranscriptText()`:
+```csharp
+// BEFORE (walking anchor — BUG):
+var chainAnchor = earliestInWindow.EffectiveSpeechTime;
+foreach (var older in beforeWindow)
+{
+    double gap = (chainAnchor - older.EffectiveSpeechTime).TotalSeconds;
+    if (gap <= UtteranceChainGapSeconds)
+    {
+        result.Insert(0, older);
+        chainAnchor = older.EffectiveSpeechTime;  // ← walks backward forever
+    }
+    else { break; }
+}
+
+// AFTER (fixed anchor — correct):
+var fixedAnchor = earliestInWindow.EffectiveSpeechTime;
+foreach (var older in beforeWindow)
+{
+    double gap = (fixedAnchor - older.EffectiveSpeechTime).TotalSeconds;
+    if (gap <= UtteranceChainGapSeconds)
+    {
+        result.Insert(0, older);
+        // fixedAnchor does NOT move — only genuine pauses bridge across
+    }
+    // No break needed; once chunks exceed 2s from window start, all
+    // remaining ones will too (list is time-ordered)
+}
+```
+
+**Impact:**
+| | Before | After |
+|---|---|---|
+| Effective window (continuous speech) | 6s always | 3s + up to 2s bridge = 5s max |
+| Fix#6 log lines per call | 1–9 growing | 0 or 1 (genuine pause only) |
+| Stale speech in matcher | Words from 4–6s ago | Words from 3s ago only |
+
+**Status:** 🔲 **PENDING** — fix is small, one file, 5 lines.
+
+---
+
+### ASR Efficiency — Parakeet-TDT-0.6B-v2 on OpenVINO (analysed 2026-06-19)
+
+**Finding: No action required. Pipeline is healthy.**
+
+| Metric | Value |
+|---|---|
+| Steady-state GPU latency | **63–69ms** per inference |
+| First call warm-up penalty | ~105ms (session-once, expected) |
+| Total ASR calls in today's run | 23 |
+| Model tensor shape | `[1, 128, 1250]` — static, always padded to 20s |
+| Burst early calls (16800/22400/28000 samples) | Return **empty string** — not garbage |
+| GPU waste per burst start | ~195ms (3 × ~65ms) — silent, harmless |
+
+**Why not fixed:** Parakeet-TDT v2 was exported with a static shape (non-streaming).
+The burst early calls run full 1250-frame inference on short clips and correctly return empty —
+no false highlights, no garbled output. The 195ms GPU overhead at burst start is invisible
+to the presenter. Raising `AsrMinStepMs` further would increase first-word latency more than
+it saves. Leave as-is.
+
+---
+
+### Voice-Triggered Commands — What EXISTS in the code
+
+#### ✅ Laser On / Off — `Orchestrator.cs` ProcessingLoopAsync
+
+Logic: `lowerTranscript.Contains("laser on")` / `lowerTranscript.Contains("laser off")`
+
+| What to say | Effect |
+|---|---|
+| **"laser on"** | Enables highlighting. App starts reacting to speech → slide elements. |
+| **"laser off"** | Disables highlighting. Clears all active highlights immediately. |
+
+Notes:
+- Substring match (case-insensitive) — works mid-sentence too ("please laser on")
+- On trigger: clears transcript buffer + ASR buffer so stale words don't re-fire
+- `IsLaserEnabled` must be `true` for ANY highlight to render — this is the master gate
+- App starts with `IsLaserEnabled = false` on every launch (you must say "laser on" first)
+
+#### ✅ Voice Slide Navigation — `Orchestrator.cs` `TryGetSlideNavigationCommand()`
+
+**Regex (exact):**
+```
+^\s*(?:please\s+)?(?:(?:go|move|switch|jump|take|show)\s+(?:to\s+)?)?(?<dir>next|previous|prev|back)\s+slide(?:\s+please)?\s*$
+```
+
+**What to say — GO FORWARD:**
+| Phrase | Works? |
+|---|---|
+| "next slide" | ✅ |
+| "go to next slide" | ✅ |
+| "go next slide" | ✅ |
+| "move to next slide" | ✅ |
+| "switch to next slide" | ✅ |
+| "jump to next slide" | ✅ |
+| "please next slide" | ✅ |
+| "next slide please" | ✅ |
+| "show next slide" | ✅ |
+
+**What to say — GO BACK:**
+| Phrase | Works? |
+|---|---|
+| "previous slide" | ✅ |
+| "prev slide" | ✅ |
+| "back slide" | ✅ |
+| "go to previous slide" | ✅ |
+| "move back slide" | ✅ |
+| "please previous slide" | ✅ |
+
+**Deliberately suppressed (won't navigate):**
+| Phrase | Why suppressed |
+|---|---|
+| "as we saw in previous slide" | `NavigationContextPhrases` exclusion |
+| "in the previous slide" | `NavigationContextPhrases` exclusion |
+| "from the previous slide" | `NavigationContextPhrases` exclusion |
+| "on the previous slide" | `NavigationContextPhrases` exclusion |
+
+Notes:
+- 1500ms cooldown between navigation commands (prevents double-firing)
+- Works only during SlideShow mode (`SlideShowWindows[1].View.Next()`)
+- Restores slideshow window focus after navigating via Win32 `SetForegroundWindow`
+- Navigation works **regardless of laser state** (doesn't need "laser on" first)
+
+#### ⚠️ Known Limitation — Laser must be ON before highlights fire
+
+The app flow on every launch:
+1. Open app → `IsLaserEnabled = false`
+2. Say **"laser on"** → highlights start working
+3. Say any slide content keyword → highlight fires
+4. Say **"laser off"** → highlights stop, screen clears
+5. Slide nav works at any time regardless of laser state
+
+---
+
+### Updated Prioritised Next Steps (Section 6 addendum)
+
+```
+IMMEDIATE (small fixes, high value):
+  Bug #14  — Fix Fix#6 chain walk in TranscriptProcessor.cs (5 lines, 1 file)
+  Bug #3   — Remove hard-coded config overrides in Orchestrator constructor
+
+NEXT SPRINT:
+  P0-B     — Embed GptDescription (not AltText) for SemanticEmbedding
+  Bug #6   — Cache metadata embeddings (stop recomputing every 50ms tick)
+  P1-A     — Add verbal_triggers to GPT structured prompt
+  P1-C     — Temporal carryover score (kills highlight flickering)
+  P1-D     — Image type classification + type-aware thresholds
+```
+

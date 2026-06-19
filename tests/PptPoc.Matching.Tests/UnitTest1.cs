@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -259,7 +259,7 @@ public class ImageReferenceMatcherTests
         var img2 = MakeImage("img-2");
         var imgs = MakeImageList(img1, img2);
 
-        var (score, phrase, _) = ImageReferenceMatcher.Score(
+        var (score, phrase, _, _) = ImageReferenceMatcher.Score(
             "the first image shows the layout",
             null, img1, 0, imgs, new DummySemanticService());
 
@@ -275,7 +275,7 @@ public class ImageReferenceMatcherTests
         var imgs = MakeImageList(img1, img2);
 
         // "second" in normal speech without an image noun should NOT trigger
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "wait a second let me think",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -289,7 +289,7 @@ public class ImageReferenceMatcherTests
         var img2 = MakeImage("img-2");
         var imgs = MakeImageList(img1, img2);
 
-        var (score, phrase, _) = ImageReferenceMatcher.Score(
+        var (score, phrase, _, _) = ImageReferenceMatcher.Score(
             "now look at the second chart here",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -306,7 +306,7 @@ public class ImageReferenceMatcherTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "this feature is supported by the platform",
             null, img, 0, MakeImageList(img), new DummySemanticService());
 
@@ -323,7 +323,7 @@ public class ImageReferenceMatcherTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "this feature is supported by the platform",
             null, img, 0, MakeImageList(img), new DummySemanticService());
 
@@ -341,7 +341,7 @@ public class ImageReferenceMatcherTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "quarterly revenue growth was impressive",
             null, img, 0, MakeImageList(img), new DummySemanticService());
 
@@ -359,7 +359,7 @@ public class ImageReferenceMatcherTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "AI is at one percent",
             null, img, 0, MakeImageList(img), new DummySemanticService());
 
@@ -371,7 +371,7 @@ public class ImageReferenceMatcherTests
     {
         var img = MakeImage("img-1", altText: "revenue growth chart");
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "this chart shows revenue growth",
             null, img, 0, MakeImageList(img), new DummySemanticService());
 
@@ -385,7 +385,7 @@ public class ImageReferenceMatcherTests
         var img = MakeImage("img-1");
         img.SemanticEmbedding = new float[] { 1f, 0f, 0f };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "just random unrelated speech here",
             new float[] { 0f, 1f, 0f },
             img, 0, MakeImageList(img), semanticService);
@@ -398,7 +398,7 @@ public class ImageReferenceMatcherTests
     {
         var img = MakeImage("img-1", altText: "test image");
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "", null, img, 0, MakeImageList(img), new DummySemanticService());
 
         Assert.Equal(0.0, score);
@@ -413,11 +413,11 @@ public class ImageReferenceMatcherTests
         imgRight.Left = 500; imgRight.Width = 100;
         var imgs = MakeImageList(imgLeft, imgRight);
 
-        var (scoreRight, _, _) = ImageReferenceMatcher.Score(
+        var (scoreRight, _, _, _) = ImageReferenceMatcher.Score(
             "on the right we can see the results",
             null, imgRight, 1, imgs, new DummySemanticService());
 
-        var (scoreLeft, _, _) = ImageReferenceMatcher.Score(
+        var (scoreLeft, _, _, _) = ImageReferenceMatcher.Score(
             "on the right we can see the results",
             null, imgLeft, 0, imgs, new DummySemanticService());
 
@@ -435,7 +435,7 @@ public class ImageReferenceMatcherTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "growth is 25 percent",
             null, img, 0, MakeImageList(img), new DummySemanticService());
 
@@ -793,11 +793,12 @@ public class DebounceManagerTests
     [Fact]
     public void ShouldHighlight_ImageMatch_RequiresDoubleStability()
     {
+        // FIX: Image matches no longer need 2x stability votes.
+        // With StabilityRequiredCycles=1, image highlights on first cycle.
         var config = DefaultDebounceConfig;
         config.StabilityRequiredCycles = 1;
         var debounce = new DebounceManager(config);
 
-        Assert.False(debounce.ShouldHighlight("img-1", 0.9, MatchType.ImageMatch));
         Assert.True(debounce.ShouldHighlight("img-1", 0.9, MatchType.ImageMatch));
     }
 
@@ -1316,11 +1317,11 @@ public class ImageReferenceMatcherEdgeCaseTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { img1, img2 };
 
-        var (score1, _, _) = ImageReferenceMatcher.Score(
+        var (score1, _, _, _) = ImageReferenceMatcher.Score(
             "the third image shows something",
             null, img1, 0, imgs, new DummySemanticService());
 
-        var (score2, _, _) = ImageReferenceMatcher.Score(
+        var (score2, _, _, _) = ImageReferenceMatcher.Score(
             "the third image shows something",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -1336,7 +1337,7 @@ public class ImageReferenceMatcherEdgeCaseTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { img1, img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "look at the first picture",
             null, img1, 0, imgs, new DummySemanticService());
 
@@ -1354,7 +1355,7 @@ public class ImageReferenceMatcherEdgeCaseTests
             });
         var imgs = new List<ImageElement> { img };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "this chart shows the revenue",
             null, img, 0, imgs, new DummySemanticService());
 
@@ -1374,7 +1375,7 @@ public class ImageReferenceMatcherEdgeCaseTests
         var img = MakeImage("img-1", ocrWords: ocrWords);
         var imgs = new List<ImageElement> { img };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the value is ab cd",
             null, img, 0, imgs, new DummySemanticService());
 
@@ -1387,7 +1388,7 @@ public class ImageReferenceMatcherEdgeCaseTests
         var img = MakeImage("img-1", keywords: new List<string> { "revenue", "growth", "quarterly" });
         var imgs = new List<ImageElement> { img };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "quarterly revenue growth was impressive",
             null, img, 0, imgs, new DummySemanticService());
 
@@ -1400,7 +1401,7 @@ public class ImageReferenceMatcherEdgeCaseTests
         var img = MakeImage("img-1", altText: "revenue growth quarterly chart");
         var imgs = new List<ImageElement> { img };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "quarterly revenue growth was impressive",
             null, img, 0, imgs, new DummySemanticService());
 
@@ -1423,7 +1424,7 @@ public class ImageReferenceMatcherEdgeCaseTests
             var config = new AppConfig { MatchConfidenceThreshold = 0.01 };
         foreach (var phrase in casualPhrases)
         {
-            var (score, _, _) = ImageReferenceMatcher.Score(
+            var (score, _, _, _) = ImageReferenceMatcher.Score(
                 phrase, null, img2, 1, imgs, new DummySemanticService());
             Assert.True(score < 0.5, $"Casual '{phrase}' should not trigger image match, got {score}");
         }
@@ -1440,7 +1441,7 @@ public class ImageReferenceMatcherEdgeCaseTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, targetWord) = ImageReferenceMatcher.Score(
+        var (score, _, targetWord, _) = ImageReferenceMatcher.Score(
             "quarterly revenue growth is strong",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -1452,7 +1453,7 @@ public class ImageReferenceMatcherEdgeCaseTests
     public void EmptyImageList_NoException()
     {
         var img = MakeImage("img-1");
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "some text here",
             null, img, 0, new List<ImageElement>(), new DummySemanticService());
 
@@ -1558,11 +1559,11 @@ public class DebounceManagerEdgeCaseTests
     [Fact]
     public void ImageMatch_NeedsDoubleStability_Config1()
     {
-        // StabilityRequired=1, so image needs 2
+        // FIX: Image matches now use same stability as text (no 2x multiplier).
+        // With stability=1, image highlights on 1st vote.
         var debounce = new DebounceManager(Config(stability: 1));
 
-        Assert.False(debounce.ShouldHighlight("img", 0.9, MatchType.ImageMatch)); // 1st
-        Assert.True(debounce.ShouldHighlight("img", 0.9, MatchType.ImageMatch));  // 2nd
+        Assert.True(debounce.ShouldHighlight("img", 0.9, MatchType.ImageMatch)); // 1st vote suffices
     }
 
     [Fact]
@@ -2077,7 +2078,7 @@ public class RegressionTests
             { new() { Text = "Open", X = 0.1, Y = 0.1, Width = 0.1, Height = 0.1 } });
         var imgs = new List<ImageElement> { MakeImage("pic5", "Picture 5"), img };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "second easy however the problem is different",
             null, img, 1, imgs, new DummySemanticService());
 
@@ -2091,7 +2092,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { img1, img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "second however we need to consider the implications",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2104,7 +2105,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "wait a second let me think about this",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2117,7 +2118,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the second point I want to make is about performance",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2130,7 +2131,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "for the second time we see that the results are consistent",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2145,7 +2146,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "now look at the second chart here",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2158,7 +2159,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the second image illustrates the architecture",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2171,7 +2172,7 @@ public class RegressionTests
         var img1 = MakeImage("img-1");
         var imgs = new List<ImageElement> { img1, MakeImage("img-2") };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the first picture shows the overview",
             null, img1, 0, imgs, new DummySemanticService());
 
@@ -2184,7 +2185,7 @@ public class RegressionTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "as we can see in the second graph the trend is clear",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -2201,7 +2202,7 @@ public class RegressionTests
         var img1 = MakeImage("img-1");
         var imgs = new List<ImageElement> { img1, MakeImage("img-2") };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             $"the first {noun} demonstrates the concept",
             null, img1, 0, imgs, new DummySemanticService());
 
@@ -2218,7 +2219,7 @@ public class RegressionTests
         var img = MakeImage("chart3", "Chart 3");
         img.SemanticEmbedding = new float[] { 1f, 0f, 0f };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the platform is supported by multiple frameworks",
             new float[] { 0f, 1f, 0f }, img, 0,
             new List<ImageElement> { img }, semanticService);
@@ -2233,7 +2234,7 @@ public class RegressionTests
         var img = MakeImage("img-1");
         img.SemanticEmbedding = new float[] { 1f, 0f, 0f };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "completely unrelated speech about weather",
             new float[] { 0f, 1f, 0f }, img, 0,
             new List<ImageElement> { img }, semanticService);
@@ -2248,7 +2249,7 @@ public class RegressionTests
         var img = MakeImage("img-1");
         img.SemanticEmbedding = new float[] { 1f, 0f, 0f };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "so basically what I was saying is that the results are interesting",
             new float[] { 0f, 1f, 0f }, img, 0,
             new List<ImageElement> { img }, semanticService);
@@ -2267,7 +2268,7 @@ public class RegressionTests
         };
         var img = MakeImage("pic4", "Picture 4", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "this feature is supported by the platform today",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2283,7 +2284,7 @@ public class RegressionTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "we are open to suggestions and new ideas",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2302,7 +2303,7 @@ public class RegressionTests
         };
         var img = MakeImage("pic6", "Picture 6", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the open source project is supported by the community",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2320,7 +2321,7 @@ public class RegressionTests
         };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the performance results are very promising",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2340,7 +2341,7 @@ public class RegressionTests
         };
         var img = MakeImage("img-1", "Chart 1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "quarterly revenue growth was impressive",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2656,7 +2657,7 @@ public class RegressionTests
         var img = MakeImage("img-1", keywords: new List<string> { "bar", "chart" });
         img.SemanticEmbedding = new float[] { 1f, 0f, 0f };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the quarterly earnings report shows improvement",
             new float[] { 0f, 1f, 0f }, img, 0,
             new List<ImageElement> { img }, semanticService);
@@ -2674,7 +2675,7 @@ public class RegressionTests
         { new() { Text = "5", X = 0.1, Y = 0.1, Width = 0.05, Height = 0.05 } };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "we have 5 items in the list",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2688,7 +2689,7 @@ public class RegressionTests
         { new() { Text = "AI", X = 0.1, Y = 0.1, Width = 0.1, Height = 0.05 } };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "AI is changing the world",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2702,7 +2703,7 @@ public class RegressionTests
         { new() { Text = "%", X = 0.1, Y = 0.1, Width = 0.02, Height = 0.05 } };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the accuracy is 97 percent",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2762,7 +2763,7 @@ public class RegressionTests
         var img = MakeImage("img-1");
         img.Left = 500; img.Width = 100;
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "on the right we can see something interesting",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -2782,9 +2783,7 @@ public class RegressionTests
             HighlightDurationMs = 2000
         });
 
-        // ImageMatch needs 2 * StabilityRequired = 4 votes
-        Assert.False(debounce.ShouldHighlight("img-1", 0.9, MatchType.ImageMatch));
-        Assert.False(debounce.ShouldHighlight("img-1", 0.9, MatchType.ImageMatch));
+        // FIX: ImageMatch now uses same StabilityRequired (no 2x). With stability=2, needs 2 votes.
         Assert.False(debounce.ShouldHighlight("img-1", 0.9, MatchType.ImageMatch));
         Assert.True(debounce.ShouldHighlight("img-1", 0.9, MatchType.ImageMatch));
     }
@@ -2995,7 +2994,7 @@ public class ImprovementVerificationTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the second thing I want to discuss with you about this image",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -3009,7 +3008,7 @@ public class ImprovementVerificationTests
         var img1 = MakeImage("img-1");
         var imgs = new List<ImageElement> { img1, MakeImage("img-2") };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the first chart shows the results",
             null, img1, 0, imgs, new DummySemanticService());
 
@@ -3023,7 +3022,7 @@ public class ImprovementVerificationTests
         var img1 = MakeImage("img-1");
         var imgs = new List<ImageElement> { img1, MakeImage("img-2") };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the first really important chart here",
             null, img1, 0, imgs, new DummySemanticService());
 
@@ -3038,7 +3037,7 @@ public class ImprovementVerificationTests
         var img2 = MakeImage("img-2");
         var imgs = new List<ImageElement> { MakeImage("img-1"), img2 };
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the second one I want to discuss is important",
             null, img2, 1, imgs, new DummySemanticService());
 
@@ -3055,7 +3054,7 @@ public class ImprovementVerificationTests
         { new() { Text = "Open", X = 0.1, Y = 0.1, Width = 0.2, Height = 0.1 } };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "we are open to suggestions and new ideas",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -3070,7 +3069,7 @@ public class ImprovementVerificationTests
         { new() { Text = "GPU", X = 0.1, Y = 0.1, Width = 0.2, Height = 0.1 } };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the GPU utilization is very high",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
@@ -3085,12 +3084,14 @@ public class ImprovementVerificationTests
         { new() { Text = "Revenue", X = 0.1, Y = 0.1, Width = 0.2, Height = 0.1 } };
         var img = MakeImage("img-1", ocrWords: ocrWords);
 
-        var (score, _, _) = ImageReferenceMatcher.Score(
+        var (score, _, _, _) = ImageReferenceMatcher.Score(
             "the revenue was very impressive this quarter",
             null, img, 0, new List<ImageElement> { img }, new DummySemanticService());
 
-        Assert.True(score <= 0.45 && score > 0.30,
-            $"5+ char OCR word should be capped at 0.45 not 0.30, got {score}");
+        // FIX: Enhancement #9 changed single-word cap: <8 chars → 0.25, >=8 chars → 0.40
+        // "Revenue" is 7 chars → cap at 0.25
+        Assert.True(score <= 0.25 && score > 0.10,
+            $"7-char OCR word should be capped at 0.25 (Enhancement #9), got {score}");
     }
 
     [Fact]
@@ -3263,8 +3264,11 @@ public class ImprovementVerificationTests
         // Element 2 with slightly lower confidence: blocked by stickiness (needs +0.10 margin)
         Assert.False(debounce.ShouldHighlight("t2", 0.89, MatchType.TextMatch));
 
-        // Element 2 with enough margin: passes stickiness
-        Assert.True(debounce.ShouldHighlight("t2", 1.01, MatchType.TextMatch));
+        // Fix #3: At T=101ms, decayed margin=0.144, so t2 needs > 1.044
+        Assert.False(debounce.ShouldHighlight("t2", 1.01, MatchType.TextMatch));
+
+        // Element 2 with enough margin to overcome decayed stickiness
+        Assert.True(debounce.ShouldHighlight("t2", 1.06, MatchType.TextMatch));
     }
 
     [Fact]
@@ -3414,10 +3418,12 @@ public class OcrClusteringTests
     [Fact]
     public void SingleMatchedWord_ValidProxyRect()
     {
+        // FIX: Use 8+ char word ("Quarterly") so single-word cap is 0.40
+        // (>= 8 chars), after -0.20 image penalty = 0.20, above LC threshold 0.15
         var img = MakeChartImage("chart1");
         img.ExtractedWords = new List<OcrWordInfo>
         {
-            W("Revenue", 0.20, 0.30, 0.18, 0.08),
+            W("Quarterly", 0.20, 0.30, 0.18, 0.08),
         };
 
         var engine = new MatcherEngine(LC, new DummySemanticService());
@@ -3467,15 +3473,16 @@ public class OcrClusteringTests
         // Naive full-span width = (0.80+0.12 - 0.05)*400 = 348.
         // Cluster with Q3@0.80 + $4.2B is much narrower.
         var img = MakeChartImage("chart1");
+        // FIX: Use 3+ char words so OCR filter doesn't skip them
         img.ExtractedWords = new List<OcrWordInfo>
         {
-            W("Q3",    0.05, 0.80),
-            W("Q3",    0.80, 0.20),
-            W("$4.2B", 0.80, 0.28),
+            W("Revenue", 0.05, 0.80),
+            W("Revenue", 0.80, 0.20),
+            W("Growth",  0.80, 0.28),
         };
 
         var engine = new MatcherEngine(LC, new DummySemanticService());
-        var results = engine.Match("Q3 revenue is $4.2B this year as shown", OneImageSlide(img));
+        var results = engine.Match("revenue growth is strong this year as shown", OneImageSlide(img));
 
         Assert.NotEmpty(results);
         var elem = results[0].Element;
@@ -4180,3 +4187,5 @@ public class OcrClusteringMonkeyTests
         Assert.Equal("Revenue", clusters[0][0].Text);
     }
 }
+
+

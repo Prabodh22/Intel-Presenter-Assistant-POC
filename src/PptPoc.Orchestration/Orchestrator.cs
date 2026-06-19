@@ -1,4 +1,4 @@
-﻿using PptPoc.Core.Configuration;
+using PptPoc.Core.Configuration;
 using PptPoc.Core.Interfaces;
 using PptPoc.Core.Models;
 using PptPoc.Matching;
@@ -12,6 +12,22 @@ public class Orchestrator : IOrchestrator
 {
     private static readonly ILogger Log = Serilog.Log.ForContext<Orchestrator>();
     private const int SampleRateHz = 16000;
+
+    // -- Gold Mine #1: VAD Energy Threshold --------------------------
+    private float _vadEnergyThreshold = 0.0015f;
+
+    // -- Fix #4: Filler words to strip before matching ---------------
+    // These carry zero signal for slide content matching. Stripping them
+    // prevents dilution of real keywords (e.g., "um um um physics" becomes
+    // just "physics" for matching, but "um um um" alone won't match anything).
+    private static readonly HashSet<string> FillerWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "um", "uh", "hmm", "hm", "mm", "mmm", "oh", "ah", "aha",
+        "uh-huh", "yeah", "yep", "yup", "nah", "nope",
+        "okay", "ok", "right", "alright", "sure",
+        "like", "well", "so", "basically", "actually", "literally",
+        "you know", "i mean", "let me see", "let's see"
+    };
 
     private readonly AppConfig _config;
     private readonly IPowerPointService _pptService;
@@ -43,6 +59,15 @@ public class Orchestrator : IOrchestrator
     private int _lastSlideIndex = -1;
     private SlideSnapshot? _currentSnapshot;
 
+    // ── PPT switch detection ──────────────────────────────────────────────────
+    // Tracks the full file path of the currently active presentation.
+    // When it changes mid-session, the KB is hot-reloaded from the cached YAML
+    // (near-instant — no GPT calls) and all state is reset for the new deck.
+    private string? _lastPptPath;
+
+    // -- Gold Mine #5: Cached slide vocabulary for early correction ---
+    private IReadOnlyList<string> _slideVocabulary = Array.Empty<string>();
+
     // Transcript change detection
     private string _lastTranscriptText = string.Empty;
 
@@ -56,6 +81,15 @@ public class Orchestrator : IOrchestrator
     private long _samplesReceivedTotal;
     private long _lastTranscribedSampleTotal;
 
+    // -- Gold Mine #1: VAD silence tracking --------------------------
+    private int _consecutiveSilenceSkips;
+
+    // -- Fix #4: ASR quarantine after slide change -------------------
+    // The first ASR result after a slide change contains audio captured
+    // BEFORE the change. Discarding it prevents stale words from the old
+    // slide context from matching on the new slide.
+    private bool _discardNextAsrResult;
+
     // COM interop calls must execute on the UI STA context.
     private SynchronizationContext? _uiContext;
 
@@ -64,8 +98,15 @@ public class Orchestrator : IOrchestrator
     private int _lastNotesSlideIndex = -1;
     private string? _lastDemoQueryForSlide;
     private const double PresenterNotesMinScore = 0.35;
+
+    // ── Nav regex: NO ^ or $ anchors — matches command anywhere in the transcript ──
+    // Fix: previously anchored with ^ and $, so stale speech prepended by Fix#6's
+    // chain walk ("tell me about it next slide please") prevented the command from
+    // ever firing until the stale chunks expired (~10s delay).
+    // Without anchors the regex finds "next slide" / "previous slide" as a substring,
+    // which is safe because NavigationContextPhrases suppresses false positives first.
     private static readonly Regex DirectNavigationRegex = new(
-        @"^\s*(?:please\s+)?(?:(?:go|move|switch|jump|take|show)\s+(?:to\s+)?)?(?<dir>next|previous|prev|back)\s+slide(?:\s+please)?\s*$",
+        @"(?:please\s+)?(?:(?:go|move|switch|jump|take|show)\s+(?:to\s+)?)?(?<dir>next|previous|prev|back)\s+slide(?:\s+please)?",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly string[] NavigationContextPhrases =
@@ -100,16 +141,18 @@ public class Orchestrator : IOrchestrator
     {
         _config = config;
         
-        // Phase 1 Latency Optimization settings over-rides for real-time responsiveness
+        // Phase 2 Latency Optimization — tuned from log analysis (pptpoc-20260617.log)
         _config.OrchestratorLoopMs = 50; 
-        _config.AsrMinStepMs = 150;     // Transcribe as soon as 150ms of new audio is received
-        _config.TranscriptWindowSeconds = 5; // Shorter window so stale phrases expire faster
+        _config.AsrMinStepMs = 150;
+
+        _config.TranscriptWindowSeconds = 3;
         
-        // Phase 1 Fixes for Flickering
-        _config.HighlightDurationMs = 2000; // Keep highlights alive but not too long
-        _config.CooldownMs = 800;           // Faster re-highlighting for responsiveness
-        _config.GlobalCooldownMs = 300;     // Prevent jumping between elements too rapidly
-        _config.StabilityRequiredCycles = 1;    // 1 cycle for both text and images
+        _config.HighlightDurationMs = 1500;
+        _config.CooldownMs = 400;
+        _config.GlobalCooldownMs = 150;
+        _config.StabilityRequiredCycles = 1;
+
+        _config.MatchConfidenceThreshold = 0.35;
         
         _pptService = pptService;
         _slideReader = slideReader;
@@ -185,11 +228,44 @@ public class Orchestrator : IOrchestrator
             throw new InvalidOperationException("No microphone detected or access is blocked. Please check your Windows Sound & Privacy settings.", ex);
         }
 
+        // -- VAD Auto-Calibration ----------------------------------------
+        // Listen to ambient noise for ~2 seconds, then set the threshold
+        // at 3x the noise floor. This adapts to quiet/loud rooms, close/far
+        // mics, and different hardware gain levels automatically.
+        try
+        {
+            var calibrator = new VadCalibrator();
+            _vadEnergyThreshold = await calibrator.CalibrateSilenceOnlyAsync(
+                _audioCapture, durationMs: 2000);
+
+            // ── VadMaxThreshold safety cap ──────────────────────────────────
+            // In noisy environments (fan spin-up, PC activity at startup) the
+            // ambient noise p95 can be 5-10x higher than normal, pushing the
+            // calibrated threshold (noise_p95 × 3) ABOVE typical speech RMS
+            // (0.003–0.009) and silently blocking ALL voice for the entire session.
+            // Cap at VadMaxThreshold (default 0.005) so normal speech always
+            // passes through even when the room is noisier than usual at startup.
+            if (_config.VadMaxThreshold > 0f && _vadEnergyThreshold > _config.VadMaxThreshold)
+            {
+                Log.Warning("VAD threshold capped: calibrated {Raw:F6} > VadMaxThreshold {Cap:F6}. " +
+                            "Using cap — room noise was unusually high at startup.",
+                    _vadEnergyThreshold, _config.VadMaxThreshold);
+                _vadEnergyThreshold = _config.VadMaxThreshold;
+            }
+
+            Log.Information("VAD threshold auto-calibrated to {Threshold:F6}", _vadEnergyThreshold);
+            StatusChanged?.Invoke($"VAD calibrated: {_vadEnergyThreshold:F5}");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "VAD calibration failed, using default {Default}", _vadEnergyThreshold);
+        }
+
         // Start processing loops
         _cts = new CancellationTokenSource();
         _processingTask = Task.Run(() => ProcessingLoopAsync(_cts.Token));
 
-        StatusChanged?.Invoke("Running â€” speak to highlight slide elements");
+        StatusChanged?.Invoke("Running — speak to highlight slide elements");
         Log.Information("Orchestrator started");
     }
 
@@ -225,10 +301,14 @@ public class Orchestrator : IOrchestrator
         }
 
         _lastSlideIndex = -1;
+        _lastPptPath = null;
         _currentSnapshot = null;
+        _slideVocabulary = Array.Empty<string>();
         _lastTranscriptText = string.Empty;
         _samplesReceivedTotal = 0;
         _lastTranscribedSampleTotal = 0;
+        _consecutiveSilenceSkips = 0;
+        _discardNextAsrResult = false;
         _processingTask = null;
         _cts?.Dispose();
         _cts = null;
@@ -253,6 +333,45 @@ public class Orchestrator : IOrchestrator
         Interlocked.Add(ref _samplesReceivedTotal, samples.Length);
     }
 
+    /// <summary>
+    /// Gold Mine #5: Builds and caches the slide vocabulary list.
+    /// </summary>
+    private void RebuildSlideVocabulary(SlideSnapshot snapshot)
+    {
+        _slideVocabulary = snapshot.TextElements
+            .SelectMany(e => e.Words)
+            .Concat(snapshot.TextElements.Select(e => e.RawText))
+            .Concat(snapshot.ImageElements.SelectMany(i => i.InferredKeywords))
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Fix #4: Strips filler words from transcript text before matching.
+    /// "um um um physics chemistry" → "physics chemistry"
+    /// Preserves multi-word fillers too ("you know", "i mean").
+    /// Returns empty string if everything was filler.
+    /// </summary>
+    private static string StripFillerWords(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        // First remove multi-word fillers
+        var result = text;
+        foreach (var filler in FillerWords.Where(f => f.Contains(' ')))
+        {
+            result = Regex.Replace(result, @"\b" + Regex.Escape(filler) + @"\b", " ", RegexOptions.IgnoreCase);
+        }
+
+        // Then remove single-word fillers
+        var words = result.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var filtered = words.Where(w => !FillerWords.Contains(w)).ToArray();
+
+        return string.Join(" ", filtered);
+    }
+
     private async Task ProcessingLoopAsync(CancellationToken ct)
     {
         Log.Information("Processing loop started");
@@ -263,25 +382,81 @@ public class Orchestrator : IOrchestrator
             {
                 await Task.Delay(_config.OrchestratorLoopMs, ct);
 
+                // ── PPT switch detection ──────────────────────────────────────────
+                // Runs every loop tick (50ms). When the active presentation file path
+                // changes (user switched to a different PPT), hot-reload the KB from
+                // the pre-cached YAML (near-instant — no GPT calls needed) and reset
+                // all per-presentation state so matching starts clean for the new deck.
+                string? currentPptPath = _pptService.GetActivePresentationPath();
+                if (currentPptPath != null &&
+                    !string.Equals(currentPptPath, _lastPptPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Information("Presentation switched: {Old} → {New}",
+                        _lastPptPath ?? "(none)", currentPptPath);
+                    _lastPptPath = currentPptPath;
+                    _lastSlideIndex = -1; // force slide reload on next iteration
+
+                    if (_kbLoader != null)
+                    {
+                        // Same sanitisation formula as KnowledgeBasePreprocessor.PreprocessAsync
+                        string safeName = Regex.Replace(currentPptPath, "[^a-zA-Z0-9_.-]", "_");
+                        string yamlPath = $"knowledge_base_{safeName}.yaml";
+
+                        bool reloaded = _kbLoader.Reload(yamlPath);
+                        if (reloaded)
+                        {
+                            Log.Information("KB hot-reloaded for new presentation — {Count} slides ready",
+                                _kbLoader.SlideCount);
+                            StatusChanged?.Invoke("KB reloaded for new presentation");
+                        }
+                        else
+                        {
+                            Log.Warning("KB not available for new presentation — falling back to live COM reads");
+                            StatusChanged?.Invoke("No KB for new presentation (live mode)");
+                        }
+                    }
+
+                    // Clear all state from the previous presentation
+                    _transcriptProcessor.Clear();
+                    _debounce.Reset();
+                    lock (_asrBufferLock) { _asrBuffer.Clear(); }
+                    _currentSnapshot = null;
+                    _slideVocabulary = Array.Empty<string>();
+                    _lastTranscriptText = string.Empty;
+                    _samplesReceivedTotal = 0;
+                    _lastTranscribedSampleTotal = 0;
+                    _consecutiveSilenceSkips = 0;
+                    _discardNextAsrResult = true;
+                    _lastNotesPayload = string.Empty;
+                    _lastNotesSlideIndex = -1;
+                    _lastDemoQueryForSlide = null;
+                }
+
                 // Handle slide changes explicitly in the loop
                 int currentSlideIndex = _pptService.GetActiveSlideIndex();
                 if (currentSlideIndex > 0 && currentSlideIndex != _lastSlideIndex)
                 {
                     Log.Information("Slide changed from {Old} to {New}", _lastSlideIndex, currentSlideIndex);
-                    
-                    // Critical Fix for Ghost Highlights: 
-                    // Clear all highlights immediately across the presentation before loading new data
+
+                    // ── Clear the OLD slide's highlight shapes ────────────────────────
+                    // IMPORTANT: GetActiveSlideComObject() already returns the NEW slide
+                    // at this point (PPT has moved on). If we clear that, the PPTPOC_LASER
+                    // scribble drawn on the old slide is left behind permanently — visible
+                    // when the user navigates back to it.
+                    // Fix: fetch the old slide by its saved index so we scrub the right one.
+                    // The WPF overlay (slideshow mode) is always cleared regardless.
+                    object? oldSlideForClear = _lastSlideIndex > 0
+                        ? _pptService.GetSlideByIndex(_lastSlideIndex)
+                        : null;
+                    await RunOnUiAsync(() => _renderer.ClearAll(oldSlideForClear));
+
                     var slideObj = _pptService.GetActiveSlideComObject();
-                    await RunOnUiAsync(() => _renderer.ClearAll(slideObj));
-                    
                     if (slideObj != null)
                     {
-                        // Use KB snapshot if available, otherwise read from COM
                         var snapshot = _kbLoader?.IsLoaded == true
                             ? _kbLoader.GetSnapshot(currentSlideIndex) ?? _slideReader.ReadSlide(slideObj)
                             : _slideReader.ReadSlide(slideObj);
                         
-                        // Clear the audio buffer to prevent audio from the previous slide leaking into the new slide's ASR
                         lock (_asrBufferLock)
                         {
                             _asrBuffer.Clear();
@@ -289,21 +464,24 @@ public class Orchestrator : IOrchestrator
                         
                         _currentSnapshot = snapshot;
                         _lastSlideIndex = currentSlideIndex;
-                        _slideChangedAt = DateTime.UtcNow; // Start grace period
-                        _transcriptProcessor.Clear(); // Clear old context
-                        _debounce.Reset();            // Reset debounce state
+                        _slideChangedAt = DateTime.UtcNow;
+                        _transcriptProcessor.Clear();
+                        _debounce.Reset();
                         _lastTranscriptText = string.Empty;
                         _samplesReceivedTotal = 0;
                         _lastTranscribedSampleTotal = 0;
+                        _consecutiveSilenceSkips = 0;
                         _lastNotesPayload = string.Empty;
                         _lastNotesSlideIndex = -1;
                         _lastDemoQueryForSlide = null;
 
-                        // Update ASR vocabulary hints with text from the new slide
-                        var keywords = snapshot.TextElements.SelectMany(t => t.Words)
-                            .Concat(snapshot.ImageElements.SelectMany(i => i.InferredKeywords))
-                            .Distinct(StringComparer.OrdinalIgnoreCase)
-                            .ToList();
+                        // -- Fix #4: Quarantine next ASR result ------------------
+                        _discardNextAsrResult = true;
+
+                        // -- Gold Mine #5: Build vocabulary once on slide change --
+                        RebuildSlideVocabulary(snapshot);
+
+                        var keywords = _slideVocabulary.ToList();
                         _asrService.SetVocabularyHints(keywords);
 
                         StatusChanged?.Invoke($"Slide {currentSlideIndex} active");
@@ -320,21 +498,65 @@ public class Orchestrator : IOrchestrator
                 float[] audioSnapshot;
                 lock (_asrBufferLock)
                 {
-                    if (_asrBuffer.Count < _asrMinStepSamples) // Process as soon as the minimum step threshold is reached
+                    if (_asrBuffer.Count < _asrMinStepSamples)
                         continue;
 
-                    // Fetch an overlapping sliding window to give ASR the full acoustic context
                     int windowSamples = Math.Min(_asrTranscriptionWindowSamples, _asrBuffer.Count);
                     int startIndex = _asrBuffer.Count - windowSamples;
                     audioSnapshot = _asrBuffer.GetRange(startIndex, windowSamples).ToArray();
                 }
+
+                // -- Gold Mine #1: VAD Energy Gate ---------------------------
+                float sumSquares = 0;
+                for (int i = 0; i < audioSnapshot.Length; i++)
+                    sumSquares += audioSnapshot[i] * audioSnapshot[i];
+                float rmsEnergy = MathF.Sqrt(sumSquares / audioSnapshot.Length);
+
+                if (rmsEnergy < _vadEnergyThreshold)
+                {
+                    _consecutiveSilenceSkips++;
+                    if (_consecutiveSilenceSkips <= 3 || _consecutiveSilenceSkips % 20 == 0)
+                    {
+                        Log.Debug("VAD: Skipping ASR — RMS energy {Rms:F5} below threshold {Threshold} (skip #{Count})",
+                            rmsEnergy, _vadEnergyThreshold, _consecutiveSilenceSkips);
+                    }
+                    _lastTranscribedSampleTotal = samplesReceived;
+                    continue;
+                }
+                _consecutiveSilenceSkips = 0;
+
                 _lastTranscribedSampleTotal = samplesReceived;
 
                 // 2. Transcribe
-                Log.Debug("Calling ASR with {Samples} audio samples", audioSnapshot.Length);
+                Log.Debug("Calling ASR with {Samples} audio samples (RMS={Rms:F5})", audioSnapshot.Length, rmsEnergy);
                 var chunks = await _asrService.TranscribeAsync(audioSnapshot);
+
                 if (chunks.Count > 0)
                 {
+                    // -- Fix #4: Discard first ASR result after slide change -----
+                    // This audio was captured before/during the slide transition
+                    // and contains words from the old slide's context.
+                    if (_discardNextAsrResult)
+                    {
+                        _discardNextAsrResult = false;
+                        Log.Debug("Fix#4: Discarded {Count} ASR chunks from pre-slide-change audio", chunks.Count);
+                        continue;
+                    }
+
+                    // -- Gold Mine #5: Apply vocabulary correction IMMEDIATELY --
+                    if (_slideVocabulary.Count > 0)
+                    {
+                        foreach (var chunk in chunks)
+                        {
+                            var corrected = TranscriptVocabularyCorrector.Correct(chunk.Text, _slideVocabulary);
+                            if (!string.Equals(corrected, chunk.Text, StringComparison.Ordinal))
+                            {
+                                Log.Debug("VocabCorrect: '{Original}' → '{Corrected}'", chunk.Text, corrected);
+                                chunk.Text = corrected;
+                            }
+                        }
+                    }
+
                     _transcriptProcessor.AddChunks(chunks);
                 }
 
@@ -377,7 +599,7 @@ public class Orchestrator : IOrchestrator
                     continue;
                 }
 
-                // Explicit slide navigation command handling with cooldown to avoid accidental repeats.
+                // Explicit slide navigation command handling
                 if (TryGetSlideNavigationCommand(transcriptText, out bool moveNext))
                 {
                     var nowUtc = DateTime.UtcNow;
@@ -403,11 +625,11 @@ public class Orchestrator : IOrchestrator
                 if (!IsLaserEnabled)
                     continue;
 
-                // 4. Check for meaningful change â€” skip if no new words
+                // 4. Check for meaningful change
                 if (string.IsNullOrWhiteSpace(transcriptText))
                     continue;
 
-                // 4b. Grace period after slide change â€” let ASR stabilize before matching
+                // 4b. Grace period after slide change
                 if ((DateTime.UtcNow - _slideChangedAt).TotalMilliseconds < SlideChangeGraceMs)
                     continue;
 
@@ -420,12 +642,8 @@ public class Orchestrator : IOrchestrator
                         return (HasSlide: false, SlideIndex: -1, Snapshot: (SlideSnapshot?)null, SlideChanged: false);
                     }
 
-                    // Keep cleanup and rendering in one serialized COM context.
                     _renderer.ClearExpired(slideObj);
 
-                    // Read index from the SAME COM object to avoid TOCTOU race when user switches slides
-                    // mid-lambda. GetActiveSlideIndex() would issue a second COM round-trip and could
-                    // return a different slide if the user navigated between the two calls.
                     int slideIndex = _pptService.GetSlideIndexFromComObject(slideObj);
                     bool changed = slideIndex != _lastSlideIndex || _currentSnapshot == null;
                     SlideSnapshot? snapshot = changed
@@ -444,18 +662,18 @@ public class Orchestrator : IOrchestrator
                 {
                     _lastSlideIndex  = slideState.SlideIndex;
                     _currentSnapshot = slideState.Snapshot;
-                    _slideChangedAt  = DateTime.UtcNow; // Start grace period
-                    _debounce.Reset(); // Reset debounce on slide change
-                    _transcriptProcessor.Clear(); // Clear stale transcript from previous slide
+                    _slideChangedAt  = DateTime.UtcNow;
+                    _debounce.Reset();
+                    _transcriptProcessor.Clear();
+                    _consecutiveSilenceSkips = 0;
 
-                    // Push slide vocabulary into ASR so domain terms are recognised.
-                    // Include raw text (preserves casing/acronyms), individual words, and keywords.
-                    var keywords = _currentSnapshot.TextElements
-                        .SelectMany(e => e.Words)
-                        .Concat(_currentSnapshot.TextElements.Select(e => e.RawText))
-                        .Concat(_currentSnapshot.ImageElements.SelectMany(i => i.InferredKeywords))
-                        .ToList();
-                    _asrService.SetVocabularyHints(keywords);
+                    // -- Fix #4: Quarantine on late slide change too ----------
+                    _discardNextAsrResult = true;
+
+                    // -- Gold Mine #5: Rebuild vocabulary on late slide change --
+                    RebuildSlideVocabulary(_currentSnapshot);
+
+                    _asrService.SetVocabularyHints(_slideVocabulary.ToList());
 
                     // Initialize RAG agent for knowledge base augmentation
                     Log.Debug("RAG Init check: ragAgent={RagAgentNull}, kbLoaded={KbLoaded}, semService={SemServiceNull}", 
@@ -468,7 +686,6 @@ public class Orchestrator : IOrchestrator
                         _ragAgent.Initialize(_kbLoader, _currentSnapshot, _semanticService);
                         Log.Information("RAG Agent initialized for slide {SlideIndex}", slideState.SlideIndex);
 
-                        // Optional no-speech demo trigger: set env var PPTPOC_RAG_DEMO_QUERY.
                         var demoQuery = Environment.GetEnvironmentVariable("PPTPOC_RAG_DEMO_QUERY", EnvironmentVariableTarget.Process)
                             ?? Environment.GetEnvironmentVariable("PPTPOC_RAG_DEMO_QUERY", EnvironmentVariableTarget.User);
                         if (!string.IsNullOrWhiteSpace(demoQuery) && !string.Equals(_lastDemoQueryForSlide, demoQuery, StringComparison.Ordinal))
@@ -481,9 +698,6 @@ public class Orchestrator : IOrchestrator
                     }
 
                     Log.Information("Slide changed to index {SlideIndex}", slideState.SlideIndex);
-                    
-                    // Critical Fix for Observation 1: Stop immediately after slide changes so we don't accidentally match 
-                    // on the stale `transcriptText` against the NEW slide snapshot
                     continue;
                 }
 
@@ -491,11 +705,21 @@ public class Orchestrator : IOrchestrator
                     continue;
 
                 // 6. Match
+                // -- Fix #4: Strip filler words before matching --------------
+                // "um um um physics chemistry" → "physics chemistry"
+                // This prevents fillers from diluting match confidence and from
+                // occupying transcript window space.
+                var cleanedTranscript = StripFillerWords(transcriptText);
+                if (string.IsNullOrWhiteSpace(cleanedTranscript))
+                {
+                    Log.Debug("Fix#4: Transcript was all filler words, skipping match");
+                    continue;
+                }
+
+                // -- Gold Mine #5: Vocabulary correction on cleaned transcript --
                 var matchingTranscript = TranscriptVocabularyCorrector.Correct(
-                    transcriptText,
-                    _currentSnapshot.TextElements.SelectMany(e => e.Words)
-                        .Concat(_currentSnapshot.TextElements.Select(e => e.RawText))
-                        .Concat(_currentSnapshot.ImageElements.SelectMany(i => i.InferredKeywords)));
+                    cleanedTranscript,
+                    _slideVocabulary);
 
                 var matches = await _matcherEngine.MatchAsync(matchingTranscript, _currentSnapshot);
 
@@ -535,10 +759,10 @@ public class Orchestrator : IOrchestrator
                 if (!highlightApplied)
                     continue;
 
-                _debounce.RecordHighlight(topMatch.Element.ElementId, topMatch.Confidence);
+                _debounce.RecordHighlight(topMatch.Element.ElementId, topMatch.Confidence, topMatch.Type);
 
                 HighlightApplied?.Invoke(
-                    $"{topMatch.Type}: '{topMatch.MatchedPhrase}' â†’ {topMatch.Element.ShapeName} ({topMatch.Confidence:P0})");
+                    $"{topMatch.Type}: '{topMatch.MatchedPhrase}' → {topMatch.Element.ShapeName} ({topMatch.Confidence:P0})");
 
                 Log.Information("Highlight applied: {Type} on {ShapeName}, phrase='{Phrase}', confidence={Confidence:F2}",
                     topMatch.Type, topMatch.Element.ShapeName, topMatch.MatchedPhrase, topMatch.Confidence);
@@ -760,27 +984,10 @@ public class Orchestrator : IOrchestrator
         if (NavigationContextPhrases.Any(phrase => normalized.Contains(phrase, StringComparison.Ordinal)))
             return false;
 
-        // Check the full transcript first.
         var direct = DirectNavigationRegex.Match(normalized);
         if (direct.Success)
         {
             moveNext = IsNextDirection(direct.Groups["dir"].Value);
-            return true;
-        }
-
-        // Fall back to clause-level check so short imperative tails still work.
-        var segments = normalized
-            .Split(new[] { ".", ",", ";", " then ", " and then ", " and ", " but ", " so " }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(s => s.Length > 0)
-            .ToArray();
-
-        for (int i = segments.Length - 1; i >= 0; i--)
-        {
-            var match = DirectNavigationRegex.Match(segments[i]);
-            if (!match.Success)
-                continue;
-
-            moveNext = IsNextDirection(match.Groups["dir"].Value);
             return true;
         }
 

@@ -74,6 +74,20 @@ public class OpenAIVisionService : IOpenAIVisionService
         }
     }
 
+    // ── Enhancement #10: Generic "no markdown" system prompt ─────────────────
+    // Works with any LLM provider (OpenAI GPT-4o, Anthropic Claude, Google Gemini,
+    // Mistral, etc.) — explicitly instructs the model to return raw JSON without
+    // markdown code fences. Combined with the StripMarkdownFences() in SlideReader.cs,
+    // this provides defense-in-depth against the backtick-wrapping issue.
+    private const string SlideAnalysisSystemPrompt =
+        "You are an AI analyzing presentation slides. "
+        + "You will receive a slide image and a text manifest mapping the native objects to a 0-255 grid coordinates [x1, y1, x2, y2]. "
+        + "Return ONLY raw JSON — no markdown fences, no backticks, no code blocks, no explanation text. "
+        + "Return a JSON object with an array 'elements', where each item has an 'id' matching the manifest id, "
+        + "and a 'rich_description'. For text elements, extract the core semantic key takeaways and conceptual meaning. "
+        + "For image or chart elements, describe conceptually what the chart/image shows and its insights. "
+        + "This will be used for conceptual semantic similarity matching.";
+
     public async Task<string> AnalyzeSlideAsync(byte[] imageBytes, string manifest)
     {
         try
@@ -85,7 +99,7 @@ public class OpenAIVisionService : IOpenAIVisionService
                 new
                 {
                     role = "system",
-                    content = "You are an AI analyzing presentation slides. You will receive a slide image and a text manifest mapping the native objects to a 0-255 grid coordinates [x1, y1, x2, y2]. Return a JSON object with an array 'elements', where each item has an 'id' matching the manifest id, and a 'rich_description'. For text elements, extract the core semantic key takeaways and conceptual meaning. For image or chart elements, describe conceptually what the chart/image shows and its insights. This will be used for conceptual semantic similarity matching."
+                    content = SlideAnalysisSystemPrompt
                 },
                 new
                 {
@@ -124,7 +138,7 @@ public class OpenAIVisionService : IOpenAIVisionService
                         new
                         {
                             type = "text",
-                            text = "Perform OCR on this image. Return ONLY JSON with schema {\"words\":[{\"text\":\"...\",\"bbox\":[x1,y1,x2,y2]}],\"lines\":[\"...\"]}. Use pixel coordinates relative to the original image."
+                            text = "Perform OCR on this image. Return ONLY raw JSON (no markdown fences, no backticks) with schema {\"words\":[{\"text\":\"...\",\"bbox\":[x1,y1,x2,y2]}],\"lines\":[\"...\"]}. Use pixel coordinates relative to the original image."
                         },
                         BuildImageContent(base64Image)
                     }
@@ -214,7 +228,7 @@ public class OpenAIVisionService : IOpenAIVisionService
                 new
                 {
                     role = "system",
-                    content = "Explain image content for slide-semantic matching. Focus on entities, trends, numbers, and actionable insight in 2-4 sentences."
+                    content = "Explain image content for slide-semantic matching. Focus on entities, trends, numbers, and actionable insight in 2-4 sentences. Return plain text only — no markdown, no JSON."
                 },
                 new
                 {

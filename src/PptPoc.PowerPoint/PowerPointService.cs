@@ -108,6 +108,37 @@ public class PowerPointService : IPowerPointService
         }
     }
 
+    /// <summary>
+    /// Returns the COM slide object for a specific 1-based slide index.
+    /// Safe to call even after navigating away from that slide — PowerPoint
+    /// keeps all slides in memory. Used to clear highlight shapes from the
+    /// OLD slide after navigation (GetActiveSlideComObject() already returns
+    /// the new slide at that point, so we need this to reach the old one).
+    /// </summary>
+    public object? GetSlideByIndex(int slideIndex)
+    {
+        try
+        {
+            if (_app == null || slideIndex < 1)
+                return null;
+
+            // Use the slideshow presentation if running, else the active one
+            Ppt.Presentation? pres = _app.SlideShowWindows.Count > 0
+                ? _app.SlideShowWindows[1].Presentation
+                : _app.ActivePresentation;
+
+            if (pres == null || slideIndex > pres.Slides.Count)
+                return null;
+
+            return pres.Slides[slideIndex];
+        }
+        catch (COMException ex)
+        {
+            Log.Warning(ex, "Failed to get slide by index {Index}", slideIndex);
+            return null;
+        }
+    }
+
     private Ppt.Slide? GetActiveSlide()
     {
         if (_app == null)
@@ -131,6 +162,34 @@ public class PowerPointService : IPowerPointService
         catch (COMException ex)
         {
             Log.Warning(ex, "Failed to get active presentation");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Returns the full file path of the currently active/foreground presentation.
+    /// During a slideshow, prefers the presentation running in the slideshow window.
+    /// Returns null on COM error or if no presentation is open.
+    /// </summary>
+    public string? GetActivePresentationPath()
+    {
+        try
+        {
+            if (_app == null)
+                return null;
+
+            // Prefer the slideshow presentation (most accurate during presenting)
+            if (_app.SlideShowWindows.Count > 0)
+            {
+                var pres = _app.SlideShowWindows[1].Presentation;
+                return pres?.FullName;
+            }
+
+            return _app.ActivePresentation?.FullName;
+        }
+        catch (COMException ex)
+        {
+            Log.Warning(ex, "Failed to get active presentation path");
             return null;
         }
     }

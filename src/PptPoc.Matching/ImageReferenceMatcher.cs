@@ -37,11 +37,15 @@ public static class ImageReferenceMatcher
 
     /// <summary>
     /// Scores how well the transcript text references a specific image element.
-    /// Returns the matched score, matched phrase, and the list of all OCR words
-    /// whose text fired during matching (for word-level bbox highlighting).
+    /// Returns the matched score, matched phrase, the list of all OCR words
+    /// whose text fired during matching (for word-level bbox highlighting),
+    /// and whether the match was semantic (for full-shape highlighting).
     /// MatchedWords is null when no OCR evidence contributed.
+    /// IsSemanticMatch is true when the best signal came from GptDescription or
+    /// semantic embedding — in that case the renderer should highlight the
+    /// entire shape, not individual OCR word bboxes.
     /// </summary>
-    public static (double Score, string MatchedPhrase, List<OcrWordInfo>? MatchedWords) Score(
+    public static (double Score, string MatchedPhrase, List<OcrWordInfo>? MatchedWords, bool IsSemanticMatch) Score(
         string transcriptText,
         float[]? transcriptEmbedding,
         ImageElement image,
@@ -50,26 +54,35 @@ public static class ImageReferenceMatcher
         ISemanticEmbeddingService semanticService)
     {
         if (string.IsNullOrWhiteSpace(transcriptText))
-            return (0.0, string.Empty, null);
+            return (0.0, string.Empty, null, false);
 
         var tNorm = TextNormalizer.Normalize(transcriptText);
         double bestScore = 0.0;
         string bestPhrase = string.Empty;
+        bool isSemanticMatch = false;
 
         // All OCR words with fuzzy score > 0.7 — collected regardless of whether they
         // end up being the final winning signal so the renderer can highlight them all.
         var matchedWords = new List<OcrWordInfo>();
 
-        // ── 1a. Semantic matching against the GPT-4o conceptual description ────────
-        // Cap at 0.35 — semantic alone is too noisy for images.
+        // ── Enhancement #3: Determine if GptDescription exists for this image ────
+        bool hasGptDescription = !string.IsNullOrWhiteSpace(image.GptDescription);
+
+        // ── 1a. Semantic matching against the conceptual description ─────────────
+        // Enhancement #3: Raise cap from 0.35 → 0.65 when GptDescription exists.
+        // A rich description from the vision model is a high-quality semantic signal
+        // and should be trusted more than bare OCR keywords.
+        double semanticCap = hasGptDescription ? 0.65 : 0.35;
+
         if (transcriptEmbedding != null && semanticService.IsReady && image.SemanticEmbedding != null)
         {
             double semanticOcr = semanticService.ComputeCosineSimilarity(transcriptEmbedding, image.SemanticEmbedding);
-            double cappedSemantic = Math.Min(semanticOcr, 0.35);
+            double cappedSemantic = Math.Min(semanticOcr, semanticCap);
             if (cappedSemantic > bestScore)
             {
                 bestScore = cappedSemantic;
                 bestPhrase = transcriptText;
+                isSemanticMatch = true;
             }
         }
 
@@ -102,10 +115,13 @@ public static class ImageReferenceMatcher
                         adjustedScore = Math.Min(wordScore, 0.70);
                     else if (ocrHitCount == 2)
                         adjustedScore = Math.Min(wordScore, 0.60);
+                    // ── Enhancement #9: Raise floor for single OCR word matches ──
+                    // A single short word match is a very weak signal and should not
+                    // easily trigger an image highlight over text elements.
                     else
-                        adjustedScore = word.Text.Length >= 5
-                            ? Math.Min(wordScore, 0.45)
-                            : Math.Min(wordScore, 0.30);
+                        adjustedScore = word.Text.Length >= 8
+                            ? Math.Min(wordScore, 0.40)
+                            : Math.Min(wordScore, 0.25);
 
                     if (adjustedScore > bestOcrScore)
                     {
@@ -119,6 +135,7 @@ public static class ImageReferenceMatcher
             {
                 bestScore = bestOcrScore;
                 bestPhrase = bestOcrPhrase;
+                isSemanticMatch = false; // OCR word match → sub-image highlight
             }
 
             // Density gate: scale down when matched words are a small fraction of a long transcript.
@@ -133,12 +150,20 @@ public static class ImageReferenceMatcher
             }
         }
 
-        // ── 1c. Match against alt text, title, nearby text, and keywords ────────
+        // ── 1c. Match against alt text, title, nearby text, keywords,
+        //         AND GptDescription ─────────────────────────────────────────────
         var candidateTexts = new List<string>();
         if (!string.IsNullOrWhiteSpace(image.AltText)) candidateTexts.Add(image.AltText);
         if (!string.IsNullOrWhiteSpace(image.Title)) candidateTexts.Add(image.Title);
         if (!string.IsNullOrWhiteSpace(image.NearbyText)) candidateTexts.Add(image.NearbyText);
         if (image.InferredKeywords.Count > 0) candidateTexts.Add(string.Join(" ", image.InferredKeywords));
+
+        // ── Enhancement #2: Include GptDescription as a fuzzy match candidate ────
+        // This is the rich conceptual description from the vision model (e.g.
+        // "Two pie charts visualizing the MMLU-Pro dataset composition...").
+        // Without this, saying "distribution chart" would never match the image
+        // unless the exact words appeared in alt text or OCR keywords.
+        if (hasGptDescription) candidateTexts.Add(image.GptDescription!);
 
         foreach (var candidate in candidateTexts)
         {
@@ -183,7 +208,15 @@ public static class ImageReferenceMatcher
 
                 bestScore = highestCandidateMatch * keywordPenalty;
                 bestPhrase = semanticCandidate > fuzzyScore ? transcriptText : phrase;
-                // Metadata match — OCR words still kept in matchedWords if they fired
+
+                // If this winning candidate is GptDescription or a semantic signal,
+                // mark as semantic match → triggers full-shape highlight
+                bool candidateIsGptDesc = hasGptDescription && candidate == image.GptDescription;
+                bool candidateIsSemantic = semanticCandidate > fuzzyScore;
+                if (candidateIsGptDesc || candidateIsSemantic)
+                    isSemanticMatch = true;
+                else
+                    isSemanticMatch = false;
             }
         }
 
@@ -223,6 +256,8 @@ public static class ImageReferenceMatcher
                 {
                     spatialBoost = bestScore > 0.2 ? 0.3 : 0.1;
                     if (string.IsNullOrEmpty(bestPhrase)) bestPhrase = sp;
+                    // Spatial reference to a generic image → semantic (whole shape)
+                    isSemanticMatch = true;
                 }
                 break;
             }
@@ -260,6 +295,7 @@ public static class ImageReferenceMatcher
                         bestPhrase = string.IsNullOrEmpty(bestPhrase)
                             ? $"{ordinalWord} image"
                             : $"{ordinalWord} {bestPhrase}";
+                        isSemanticMatch = true; // Ordinal reference → highlight whole shape
                     }
                     break;
                 }
@@ -275,6 +311,6 @@ public static class ImageReferenceMatcher
         double finalScore = Math.Min(1.0, bestScore + spatialBoost);
 
         // Return matched OCR words only when there is at least one hit
-        return (finalScore, bestPhrase, matchedWords.Count > 0 ? matchedWords : null);
+        return (finalScore, bestPhrase, matchedWords.Count > 0 ? matchedWords : null, isSemanticMatch);
     }
 }

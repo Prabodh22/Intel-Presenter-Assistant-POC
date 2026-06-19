@@ -21,6 +21,14 @@ public class WindowsOcrService : IOcrService
     private OcrEngine? _engine;
     private bool _disposed;
 
+    // ── Enhancement #6: Minimum pixel width before upscaling kicks in ────────
+    // Chart images exported from PowerPoint shapes are often small (200-400px).
+    // The Windows OCR engine performs poorly on tiny text at that resolution.
+    // Upscaling to at least 800px wide significantly improves word extraction
+    // from axis labels, legends, and data values in chart images.
+    private const uint MinWidthForOcr = 800;
+    private const uint MaxUpscaleFactor = 3;
+
     public async Task InitializeAsync()
     {
         if (_engine != null) return;
@@ -46,6 +54,12 @@ public class WindowsOcrService : IOcrService
         });
     }
 
+    /// <summary>
+    /// Enhancement #6: Extracts text from an image, upscaling small images for better OCR.
+    /// When image width is below <see cref="MinWidthForOcr"/> pixels, the image is scaled up
+    /// (up to 3x) using high-quality Fant interpolation before OCR. This dramatically improves
+    /// recognition of small chart labels, axis values, and legend text.
+    /// </summary>
     public async Task<List<OcrWordInfo>> ExtractTextAsync(byte[] imageData)
     {
         if (_engine == null || imageData.Length == 0)
@@ -57,9 +71,39 @@ public class WindowsOcrService : IOcrService
             await stream.WriteAsync(imageData.AsBuffer());
             stream.Seek(0);
 
-            var decoder  = await BitmapDecoder.CreateAsync(stream);
-            var bitmap   = await decoder.GetSoftwareBitmapAsync(
-                BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
+            var decoder = await BitmapDecoder.CreateAsync(stream);
+
+            uint targetWidth = decoder.PixelWidth;
+            uint targetHeight = decoder.PixelHeight;
+            var transform = new BitmapTransform();
+
+            // ── Upscale small images for better OCR on chart labels ──────────
+            if (decoder.PixelWidth < MinWidthForOcr && decoder.PixelWidth > 0)
+            {
+                uint scale = Math.Min(MaxUpscaleFactor, MinWidthForOcr / Math.Max(1, decoder.PixelWidth) + 1);
+                targetWidth = decoder.PixelWidth * scale;
+                targetHeight = decoder.PixelHeight * scale;
+                transform.ScaledWidth = targetWidth;
+                transform.ScaledHeight = targetHeight;
+                transform.InterpolationMode = BitmapInterpolationMode.Fant;
+
+                Log.Debug("OCR upscaling image from {OrigW}x{OrigH} to {NewW}x{NewH} ({Scale}x)",
+                    decoder.PixelWidth, decoder.PixelHeight, targetWidth, targetHeight, scale);
+            }
+
+            var pixelData = await decoder.GetPixelDataAsync(
+                BitmapPixelFormat.Bgra8,
+                BitmapAlphaMode.Premultiplied,
+                transform,
+                ExifOrientationMode.IgnoreExifOrientation,
+                ColorManagementMode.DoNotColorManage);
+
+            var bitmap = SoftwareBitmap.CreateCopyFromBuffer(
+                pixelData.DetachPixelData().AsBuffer(),
+                BitmapPixelFormat.Bgra8,
+                (int)targetWidth,
+                (int)targetHeight,
+                BitmapAlphaMode.Premultiplied);
 
             return await RecognizeAsync(bitmap);
         }

@@ -21,6 +21,17 @@ public class SlideReader : ISlideReader
     private readonly IOpenAIVisionService? _gptVision;
     private readonly Dictionary<int, List<OcrWordInfo>> _ocrCache = new();
 
+    // ── Enhancement #7: OCR noise words to filter from InferredKeywords ──────
+    // These are chart-axis artifacts, statistical labels, and formatting noise
+    // that cause false-positive matches when the user speaks naturally.
+    private static readonly HashSet<string> OcrNoiseWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "stderr", "acc", "std", "err", "avg", "mean", "min", "max",
+        "nan", "inf", "null", "none", "true", "false",
+        "fig", "figure", "table", "source", "note", "notes",
+        "val", "var", "ref", "col", "row", "num", "pct"
+    };
+
     public SlideReader(IOcrService? ocr = null, IOpenAIVisionService? gptVision = null)
     {
         _ocr = ocr;
@@ -56,7 +67,7 @@ public class SlideReader : ISlideReader
             Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
         }
 
-        // Run GPT-4o Vision on entire slide
+        // Run LLM Vision on entire slide
         if (_gptVision != null && snapshot.ImageElements.Count > 0)
         {
             _ = RunGptVisionOnSlideAsync(snapshot, slide);
@@ -75,7 +86,7 @@ public class SlideReader : ISlideReader
     }
 
     /// <summary>
-    /// Reads a slide and awaits all async enrichment (OCR + GPT-4o vision).
+    /// Reads a slide and awaits all async enrichment (OCR + LLM vision).
     /// Use for preprocessing where we need complete data before serializing.
     /// </summary>
     public async Task<SlideSnapshot> ReadSlideFullAsync(object slideComObject)
@@ -102,7 +113,7 @@ public class SlideReader : ISlideReader
             Log.Error(ex, "Error reading shapes from slide {SlideIndex}", slide.SlideIndex);
         }
 
-        // Await OCR and GPT-4o enrichment in parallel
+        // Await OCR and LLM vision enrichment in parallel
         var tasks = new List<Task>();
 
         if ((_ocr != null || _gptVision != null) && snapshot.ImageElements.Count > 0)
@@ -114,7 +125,7 @@ public class SlideReader : ISlideReader
         if (tasks.Count > 0)
             await Task.WhenAll(tasks);
 
-        Log.Information("ReadSlideFullAsync slide {SlideIndex}: {TextCount} text, {ImageCount} image (OCR+GPT awaited)",
+        Log.Information("ReadSlideFullAsync slide {SlideIndex}: {TextCount} text, {ImageCount} image (OCR+Vision awaited)",
             snapshot.SlideIndex, snapshot.TextElements.Count, snapshot.ImageElements.Count);
 
         return snapshot;
@@ -170,7 +181,7 @@ public class SlideReader : ISlideReader
                 {
                     img.ExtractedWords = cachedWords;
                     var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
-                    foreach (var word in TokenizeWords(NormalizeText(combinedText)))
+                    foreach (var word in FilteredTokenize(NormalizeText(combinedText)))
                     {
                         if (!img.InferredKeywords.Contains(word))
                             img.InferredKeywords.Add(word);
@@ -188,7 +199,7 @@ public class SlideReader : ISlideReader
             }
         }
 
-        // Export full slide image + build manifest for GPT vision
+        // Export full slide image + build manifest for LLM vision
         if (_gptVision != null && snapshot.ImageElements.Count > 0)
         {
             try
@@ -222,7 +233,7 @@ public class SlideReader : ISlideReader
     {
         var tasks = new List<Task>();
 
-        // GPT vision analysis on full slide (no COM needed — bytes already exported)
+        // LLM vision analysis on full slide (no COM needed — bytes already exported)
         if (_gptVision != null && exports.slideImage != null)
         {
             tasks.Add(Task.Run(async () =>
@@ -232,15 +243,8 @@ public class SlideReader : ISlideReader
                     string gptJson = await _gptVision.AnalyzeSlideAsync(exports.slideImage, exports.manifest);
                     if (!string.IsNullOrWhiteSpace(gptJson))
                     {
-                        // Strip markdown code fences that Claude sometimes wraps around JSON
-                        gptJson = gptJson.Trim();
-                        if (gptJson.StartsWith("```"))
-                        {
-                            var firstNewline = gptJson.IndexOf('\n');
-                            if (firstNewline > 0) gptJson = gptJson[(firstNewline + 1)..];
-                            if (gptJson.EndsWith("```")) gptJson = gptJson[..^3];
-                            gptJson = gptJson.Trim();
-                        }
+                        // Strip markdown code fences that LLMs sometimes wrap around JSON
+                        gptJson = StripMarkdownFences(gptJson);
 
                         // Handle potentially truncated JSON from max_tokens limit
                         JsonDocument? doc = null;
@@ -263,28 +267,14 @@ public class SlideReader : ISlideReader
                         {
                             using (doc)
                             {
-                                if (doc.RootElement.TryGetProperty("elements", out var elemArr))
-                                {
-                                    foreach (var el in elemArr.EnumerateArray())
-                                    {
-                                        if (!el.TryGetProperty("id", out var idProp)) continue;
-                                        string id = idProp.GetString() ?? "";
-                                        string desc = el.TryGetProperty("rich_description", out var descProp)
-                                            ? descProp.GetString() ?? "" : "";
-                                        if (string.IsNullOrWhiteSpace(desc)) continue;
-                                        var imgTarget = snapshot.ImageElements.FirstOrDefault(x => x.ElementId == id);
-                                        if (imgTarget != null) imgTarget.GptDescription = desc;
-                                        var txtTarget = snapshot.TextElements.FirstOrDefault(x => x.ElementId == id);
-                                        if (txtTarget != null) txtTarget.GptDescription = desc;
-                                    }
-                                }
+                                ApplyVisionDescriptions(doc, snapshot);
                             }
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Log.Warning(ex, "Failed to run GPT vision analysis on slide.");
+                    Log.Warning(ex, "Failed to run vision analysis on slide.");
                 }
             }));
         }
@@ -298,6 +288,9 @@ public class SlideReader : ISlideReader
         await Task.WhenAll(tasks);
     }
 
+    // ── Enhancement #1: CRITICAL FIX — Strip markdown fences before JSON parse ──
+    // LLMs (Claude, GPT-4o, Gemini, etc.) often wrap JSON in ```json ... ```
+    // This caused a JsonReaderException on every slide in the runtime path.
     private async Task RunGptVisionOnSlideAsync(SlideSnapshot snapshot, Ppt.Slide slide)
     {
         try
@@ -323,24 +316,97 @@ public class SlideReader : ISlideReader
             
             if (!string.IsNullOrWhiteSpace(gptJson))
             {
-                using var doc = System.Text.Json.JsonDocument.Parse(gptJson);
-                var elements = doc.RootElement.GetProperty("elements").EnumerateArray();
-                foreach (var el in elements)
+                // ── FIX: Strip markdown code fences before parsing ──────────
+                gptJson = StripMarkdownFences(gptJson);
+
+                JsonDocument? doc = null;
+                try
                 {
-                    string id = el.GetProperty("id").GetString() ?? "";
-                    string desc = el.GetProperty("rich_description").GetString() ?? "";
-                    
-                    var imgTarget = snapshot.ImageElements.FirstOrDefault(x => x.ElementId == id);
-                    if (imgTarget != null) imgTarget.GptDescription = desc;
-                    
-                    var txtTarget = snapshot.TextElements.FirstOrDefault(x => x.ElementId == id);
-                    if (txtTarget != null) txtTarget.GptDescription = desc;
+                    doc = JsonDocument.Parse(gptJson);
+                }
+                catch (JsonException)
+                {
+                    // Try to salvage truncated JSON by closing the structure
+                    var salvaged = gptJson;
+                    int lastBrace = salvaged.LastIndexOf('}');
+                    if (lastBrace > 0)
+                    {
+                        salvaged = salvaged[..(lastBrace + 1)] + "]}";
+                        try { doc = JsonDocument.Parse(salvaged); }
+                        catch { /* truly unparseable */ }
+                    }
+                }
+
+                if (doc != null)
+                {
+                    using (doc)
+                    {
+                        ApplyVisionDescriptions(doc, snapshot);
+                    }
+                    Log.Information("Vision analysis applied successfully for slide {SlideIndex}", snapshot.SlideIndex);
+                }
+                else
+                {
+                    Log.Warning("Vision analysis returned unparseable JSON for slide {SlideIndex}", snapshot.SlideIndex);
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Failed to run GPT-4o analysis on slide.");
+            Log.Warning(ex, "Failed to run vision analysis on slide.");
+        }
+    }
+
+    /// <summary>
+    /// Strips markdown code fences (```json ... ```) that LLMs commonly wrap around JSON responses.
+    /// Works with any LLM provider (OpenAI, Anthropic/Claude, Google Gemini, etc.).
+    /// </summary>
+    private static string StripMarkdownFences(string raw)
+    {
+        var cleaned = raw.Trim();
+        if (cleaned.StartsWith("```"))
+        {
+            // Remove opening fence (```json, ```JSON, ```, etc.)
+            int firstNewline = cleaned.IndexOf('\n');
+            if (firstNewline > 0)
+                cleaned = cleaned[(firstNewline + 1)..];
+            else
+                cleaned = cleaned[3..]; // Edge case: no newline after ```
+
+            // Remove closing fence
+            if (cleaned.TrimEnd().EndsWith("```"))
+            {
+                int lastFence = cleaned.LastIndexOf("```");
+                if (lastFence >= 0)
+                    cleaned = cleaned[..lastFence];
+            }
+            cleaned = cleaned.Trim();
+        }
+        return cleaned;
+    }
+
+    /// <summary>
+    /// Applies vision descriptions from a parsed JSON document to the snapshot elements.
+    /// Shared between the runtime and preprocessing paths.
+    /// </summary>
+    private static void ApplyVisionDescriptions(JsonDocument doc, SlideSnapshot snapshot)
+    {
+        if (doc.RootElement.TryGetProperty("elements", out var elemArr))
+        {
+            foreach (var el in elemArr.EnumerateArray())
+            {
+                if (!el.TryGetProperty("id", out var idProp)) continue;
+                string id = idProp.GetString() ?? "";
+                string desc = el.TryGetProperty("rich_description", out var descProp)
+                    ? descProp.GetString() ?? "" : "";
+                if (string.IsNullOrWhiteSpace(desc)) continue;
+
+                var imgTarget = snapshot.ImageElements.FirstOrDefault(x => x.ElementId == id);
+                if (imgTarget != null) imgTarget.GptDescription = desc;
+
+                var txtTarget = snapshot.TextElements.FirstOrDefault(x => x.ElementId == id);
+                if (txtTarget != null) txtTarget.GptDescription = desc;
+            }
         }
     }
 
@@ -359,7 +425,7 @@ public class SlideReader : ISlideReader
                 {
                     img.ExtractedWords = cachedWords;
                     var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
-                    foreach (var word in TokenizeWords(NormalizeText(combinedText)))
+                    foreach (var word in FilteredTokenize(NormalizeText(combinedText)))
                     {
                         if (!img.InferredKeywords.Contains(word))
                             img.InferredKeywords.Add(word);
@@ -405,7 +471,8 @@ public class SlideReader : ISlideReader
                 img.ExtractedWords = ocrWords;
 
                 var combinedText = string.Join(" ", ocrWords.Select(w => w.Text));
-                var tokenized = TokenizeWords(NormalizeText(combinedText));
+                // ── Enhancement #7: Filter noise words from InferredKeywords ─
+                var tokenized = FilteredTokenize(NormalizeText(combinedText));
                 foreach (var word in tokenized)
                 {
                     if (!img.InferredKeywords.Contains(word))
@@ -429,6 +496,33 @@ public class SlideReader : ISlideReader
         {
             Log.Warning(ex, "OCR/explain failed for image element {Id}", img.ElementId);
         }
+    }
+
+    /// <summary>
+    /// Enhancement #7: Tokenize and filter out noise words from OCR output.
+    /// Removes chart-axis artifacts (stderr, acc, std), very short tokens,
+    /// and short numeric-only tokens that cause false-positive keyword matches.
+    /// </summary>
+    private static List<string> FilteredTokenize(string normalizedText)
+    {
+        var allTokens = TokenizeWords(normalizedText);
+        var filtered = new List<string>();
+
+        foreach (var word in allTokens)
+        {
+            // Skip very short tokens (1-2 chars)
+            if (word.Length < 3) continue;
+
+            // Skip known chart/statistical noise words
+            if (OcrNoiseWords.Contains(word)) continue;
+
+            // Skip short numeric-only tokens (e.g. "5107", "0041") — chart axis values
+            if (Regex.IsMatch(word, @"^\d+$") && word.Length <= 4) continue;
+
+            filtered.Add(word);
+        }
+
+        return filtered;
     }
 
     private static int ExtractShapeId(string elementId)

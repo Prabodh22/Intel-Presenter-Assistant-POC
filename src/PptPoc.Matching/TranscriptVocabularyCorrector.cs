@@ -4,6 +4,17 @@ public static class TranscriptVocabularyCorrector
 {
     private const double CandidateMargin = 0.05;
 
+    // ── Protected command words — NEVER corrected by vocab projection ─────────
+    // These are critical for voice command recognition (laser on/off, slide nav).
+    // "off" and "of" share Soundex O100 — without protection, "laser off" becomes
+    // "laser of" when the slide contains text like "state of the art".
+    // Similarly "on", "next", "previous" etc. must survive unchanged.
+    private static readonly HashSet<string> ProtectedWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "on", "off", "next", "previous", "prev", "back", "laser", "slide",
+        "please", "go", "move", "switch", "show", "jump", "take"
+    };
+
     public static string Correct(string transcriptText, IEnumerable<string> vocabularyTerms)
     {
         var normalizedTranscript = TextNormalizer.Normalize(transcriptText);
@@ -25,8 +36,15 @@ public static class TranscriptVocabularyCorrector
 
         for (int index = 0; index < tokens.Count; index++)
         {
+            // ── Skip protected command words entirely ────────────────────────
+            if (ProtectedWords.Contains(tokens[index]))
+            {
+                corrected.Add(tokens[index]);
+                continue;
+            }
+
             // --- 3-token merge (e.g. "deep sea carbon" → "deepseekcarbon" is unlikely, but "deep seek" → "deepseek") ---
-            if (index + 1 < tokens.Count)
+            if (index + 1 < tokens.Count && !ProtectedWords.Contains(tokens[index + 1]))
             {
                 var mergedToken = tokens[index] + tokens[index + 1];
                 if (TryChooseReplacement(mergedToken, vocabulary, phoneticIndex, isMergedCandidate: true, out var mergedReplacement))
@@ -134,6 +152,10 @@ public static class TranscriptVocabularyCorrector
                 {
                     if (string.Equals(pm, token, StringComparison.OrdinalIgnoreCase))
                         continue; // Already the same word
+
+                    // ── Never phonetically project onto a protected word ─────
+                    if (ProtectedWords.Contains(pm))
+                        continue;
 
                     double sim = Similarity(token, pm);
                     if (sim > bestPhoneticScore)

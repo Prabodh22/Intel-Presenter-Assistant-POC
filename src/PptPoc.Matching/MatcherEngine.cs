@@ -15,16 +15,14 @@ public class MatcherEngine : IMatcherEngine
     private readonly IRAGAgent? _ragAgent;
 
     // ── Clustering constant ──────────────────────────────────────────────────────
-    // Two OCR words are considered "co-located" (same cluster) if the distance
-    // between their centres is within 15% of image width/height.
-    // This handles:
-    //   • bar label + value label sitting next to each other   (≈0.04 apart)
-    //   • words on the same line of a table row               (≈0.05–0.10 apart)
-    //   • title + subtitle that are close                     (≈0.08 apart)
-    // While keeping separate:
-    //   • chart body vs. legend (usually 0.20–0.40 apart)
-    //   • body text vs. footnote (usually 0.30+ apart)
     private const double OcrClusterProximityThreshold = 0.15;
+
+    // ── Fix #2: Single-word match guard ──────────────────────────────────────────
+    // A match based on only 1 content word is almost always noise ("chart" matching
+    // some random OCR fragment, "budget" fuzzy-matching "business"). Require higher
+    // confidence for single-word matches unless the word is very specific (6+ chars).
+    private const double SingleWordMinConfidence = 0.50;
+    private const int SingleWordSpecificMinLength = 6; // "MMLU", "NVIDIA" etc. get a pass at 6+ chars
 
     public MatcherEngine(AppConfig config, ISemanticEmbeddingService semanticService, IRAGAgent? ragAgent = null)
     {
@@ -73,13 +71,20 @@ public class MatcherEngine : IMatcherEngine
 
             if (_scorer.MeetsThreshold(confidence))
             {
+                // ── Fix #2: Single-word noise guard ─────────────────────────
+                if (IsSingleWordNoise(phrase, confidence))
+                {
+                    Log.Debug("Fix#2: Skipping single-word text match '{Phrase}' conf={Conf:F2} (below {Min:F2})",
+                        phrase, confidence, SingleWordMinConfidence);
+                    continue;
+                }
+
                 results.Add(new MatchResult
                 {
                     Element = textElem,
                     Confidence = confidence,
                     Type = MatchType.TextMatch,
                     MatchedPhrase = phrase
-                    // MatchedOcrWords / ParentImageElement not applicable for text matches
                 });
             }
         }
@@ -88,7 +93,8 @@ public class MatcherEngine : IMatcherEngine
         for (int i = 0; i < snapshot.ImageElements.Count; i++)
         {
             var imgElem = snapshot.ImageElements[i];
-            var (score, phrase, matchedWords) = ImageReferenceMatcher.Score(
+
+            var (score, phrase, matchedWords, isSemanticMatch) = ImageReferenceMatcher.Score(
                 transcriptText, transcriptEmbedding, imgElem, i, snapshot.ImageElements, _semanticService);
 
             var (numericBoost, numericPhrase) = NumericChartMatcher.Score(transcriptText, imgElem);
@@ -100,21 +106,25 @@ public class MatcherEngine : IMatcherEngine
 
             if (_scorer.MeetsThreshold(confidence))
             {
+                // ── Fix #2: Single-word noise guard for images ──────────────
+                // Semantic matches (GptDescription) are exempt — they already
+                // encode multi-word meaning in a single score.
+                if (!isSemanticMatch && numericBoost <= 0 && IsSingleWordNoise(phrase, confidence))
+                {
+                    Log.Debug("Fix#2: Skipping single-word image match '{Phrase}' conf={Conf:F2} (below {Min:F2})",
+                        phrase, confidence, SingleWordMinConfidence);
+                    continue;
+                }
+
                 SlideElement elementToReport = imgElem;
                 SlideElement? parentForReport = null;
 
-                if (matchedWords != null && matchedWords.Count > 0)
+                if (isSemanticMatch)
                 {
-                    // ── CLUSTER SELECTION ────────────────────────────────────────
-                    // When the same word appears in multiple locations (chart title,
-                    // axis label, bar label, legend, footnote) the naïve merge of
-                    // ALL matched words produces a rect that spans nearly the entire
-                    // image — worse than the whole-image fallback.
-                    //
-                    // BestCluster() picks the single tightest group: the cluster
-                    // that has the most matched words co-located within 15% of
-                    // image size. If two clusters tie on size, reading order
-                    // (top-left) decides.
+                    Log.Debug("Semantic image match on {ElementId} — full-shape highlight", imgElem.ElementId);
+                }
+                else if (matchedWords != null && matchedWords.Count > 0)
+                {
                     var clusterWords = BestCluster(matchedWords);
 
                     Log.Debug(
@@ -123,21 +133,16 @@ public class MatcherEngine : IMatcherEngine
                         matchedWords.Count,
                         ClusterByProximity(matchedWords, OcrClusterProximityThreshold).Count);
 
-                    // Compute the merged bounding rect of the winning cluster only.
-                    // Word coords are image-relative (0–1); map to absolute slide points.
                     double minX = clusterWords.Min(w => w.X);
                     double minY = clusterWords.Min(w => w.Y);
                     double maxX = clusterWords.Max(w => w.X + w.Width);
                     double maxY = clusterWords.Max(w => w.Y + w.Height);
 
-                    // Clamp to [0,1] in case OCR returned slightly out-of-bounds coords
                     minX = Math.Max(0.0, minX);
                     minY = Math.Max(0.0, minY);
                     maxX = Math.Min(1.0, maxX);
                     maxY = Math.Min(1.0, maxY);
 
-                    // Guard: if clamping collapsed the rect (e.g. all coords were
-                    // negative or > 1.0), fall back to whole-image highlight
                     if (maxX <= minX || maxY <= minY)
                     {
                         Log.Warning(
@@ -151,7 +156,6 @@ public class MatcherEngine : IMatcherEngine
                         float absWidth  = (float)((maxX - minX) * imgElem.Width);
                         float absHeight = (float)((maxY - minY) * imgElem.Height);
 
-                        // Keep a reasonable minimum so the highlight is visible
                         absWidth  = Math.Max(absWidth,  20f);
                         absHeight = Math.Max(absHeight, 12f);
 
@@ -174,25 +178,34 @@ public class MatcherEngine : IMatcherEngine
                     Confidence         = confidence,
                     Type               = MatchType.ImageMatch,
                     MatchedPhrase      = phrase,
-                    MatchedOcrWords    = matchedWords,       // null → whole-image highlight
-                    ParentImageElement = parentForReport     // null when no OCR words matched
+                    MatchedOcrWords    = matchedWords,
+                    ParentImageElement = parentForReport
                 });
             }
         }
 
-        // ── Sort: highest confidence first; text beats image at equal confidence ─
+        // ── Fix #5: Sort with consecutive-word tie-breaker ───────────────────────
+        // When multiple elements have equal confidence, prefer the one whose matched
+        // phrase has more words (deeper match). This prevents a title with 1 matching
+        // word from beating a body paragraph with 4 matching words at the same confidence.
         results.Sort((a, b) =>
         {
             int cmp = b.Confidence.CompareTo(a.Confidence);
             if (cmp != 0) return cmp;
+            // Tie-breaker: more matched words = stronger evidence
+            int aWords = CountPhraseWords(a.MatchedPhrase);
+            int bWords = CountPhraseWords(b.MatchedPhrase);
+            cmp = bWords.CompareTo(aWords);
+            if (cmp != 0) return cmp;
+            // Text beats image at equal confidence + equal phrase depth
             if (a.Type == MatchType.TextMatch && b.Type == MatchType.ImageMatch) return -1;
             if (a.Type == MatchType.ImageMatch && b.Type == MatchType.TextMatch) return  1;
             return 0;
         });
 
-        // ── Sentence heuristic: don't hijack text flow with an image highlight ──
+        // ── Enhancement #5: Reduced text-over-image override aggression ─────────
         const int sentenceWordThreshold = 5;
-        const double imageOverTextMargin = 0.12;
+        const double imageOverTextMargin = 0.05;
         int transcriptWordCount = transcriptText
             .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Length;
@@ -202,13 +215,29 @@ public class MatcherEngine : IMatcherEngine
             results[0].Type == MatchType.ImageMatch)
         {
             var bestText = results.FirstOrDefault(r => r.Type == MatchType.TextMatch);
-            if (bestText != null && bestText.Confidence >= results[0].Confidence - imageOverTextMargin)
+
+            if (bestText != null && bestText.Confidence > results[0].Confidence - imageOverTextMargin)
             {
-                results.Remove(bestText);
-                results.Insert(0, bestText);
-                Log.Debug(
-                    "Text preference override: Image={ImageConf:F2}, Text={TextConf:F2}",
-                    results[1].Confidence, bestText.Confidence);
+                bool imageIsSemantic = results[0].ParentImageElement == null
+                    && results[0].Element is ImageElement ie
+                    && !string.IsNullOrWhiteSpace(ie.GptDescription);
+
+                double requiredMargin = imageIsSemantic ? 0.15 : imageOverTextMargin;
+
+                if (bestText.Confidence > results[0].Confidence - requiredMargin)
+                {
+                    results.Remove(bestText);
+                    results.Insert(0, bestText);
+                    Log.Debug(
+                        "Text preference override: Image={ImageConf:F2}, Text={TextConf:F2} (margin={Margin:F2})",
+                        results[1].Confidence, bestText.Confidence, requiredMargin);
+                }
+                else
+                {
+                    Log.Debug(
+                        "Text override BLOCKED — semantic image match has priority: Image={ImageConf:F2}, Text={TextConf:F2}",
+                        results[0].Confidence, bestText.Confidence);
+                }
             }
         }
 
@@ -246,9 +275,14 @@ public class MatcherEngine : IMatcherEngine
                     for (int i = 0; i < results.Count; i++)
                         results[i] = _ragAgent.AugmentMatchConfidence(results[i], ragContext);
 
+                    // Re-sort with same tie-breaker logic after RAG augmentation
                     results.Sort((a, b) =>
                     {
                         int cmp = b.Confidence.CompareTo(a.Confidence);
+                        if (cmp != 0) return cmp;
+                        int aWords = CountPhraseWords(a.MatchedPhrase);
+                        int bWords = CountPhraseWords(b.MatchedPhrase);
+                        cmp = bWords.CompareTo(aWords);
                         if (cmp != 0) return cmp;
                         if (a.Type == MatchType.TextMatch && b.Type == MatchType.ImageMatch) return -1;
                         if (a.Type == MatchType.ImageMatch && b.Type == MatchType.TextMatch) return  1;
@@ -272,32 +306,47 @@ public class MatcherEngine : IMatcherEngine
     }
 
     // ════════════════════════════════════════════════════════════════════════════
-    //  OCR WORD CLUSTERING
-    //
-    //  Problem: the word "Q3" may appear 5 times in a chart (axis, bar label,
-    //  legend, title, footnote). Merging all 5 bboxes produces a rect spanning
-    //  the entire image — useless.
-    //
-    //  Solution: group words by spatial proximity, pick the cluster with the most
-    //  matched words. If two clusters tie, reading order (top-left) decides.
-    //  The winning cluster's bbox is tight around exactly the words that matter.
+    //  Fix #2: Single-word noise detection
     // ════════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Groups OCR words into clusters. Two words are in the same cluster when
-    /// the distance between their centres (in normalised 0–1 image coordinates)
-    /// is at or below <paramref name="proximityThreshold"/>.
-    ///
-    /// This is a greedy single-linkage approach seeded by the first unassigned
-    /// word: efficient for the small lists we encounter (typically 2–15 words).
+    /// Returns true if the match is based on a single short word and confidence
+    /// is below the single-word threshold. Specific/long words (6+ chars like
+    /// "MMLU", "NVIDIA", "benchmark") are exempt because they carry strong signal.
     /// </summary>
-    /// <summary>
-    /// Groups OCR words into clusters using a Union-Find (connected-components)
-    /// algorithm so that transitivity is handled correctly: if A is close to B
-    /// and B is close to C, all three end up in the same cluster even when A
-    /// and C are far apart.  A tiny epsilon (+1e-9) absorbs IEEE-754 rounding
-    /// at exact threshold boundaries.
-    /// </summary>
+    private static bool IsSingleWordNoise(string phrase, double confidence)
+    {
+        if (string.IsNullOrWhiteSpace(phrase))
+            return true;
+
+        var words = phrase.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length >= 2)
+            return false; // Multi-word match — not noise
+
+        // Single word match — check if it's specific enough
+        string word = words[0];
+        if (word.Length >= SingleWordSpecificMinLength)
+            return false; // Long/specific word like "benchmark", "engineering" — allow it
+
+        // Short single word below confidence threshold — noise
+        return confidence < SingleWordMinConfidence;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Fix #5: Phrase word count for tie-breaking
+    // ════════════════════════════════════════════════════════════════════════════
+
+    private static int CountPhraseWords(string? phrase)
+    {
+        if (string.IsNullOrWhiteSpace(phrase))
+            return 0;
+        return phrase.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  OCR WORD CLUSTERING
+    // ════════════════════════════════════════════════════════════════════════════
+
     internal static List<List<OcrWordInfo>> ClusterByProximity(
         List<OcrWordInfo> words,
         double proximityThreshold = OcrClusterProximityThreshold)
@@ -307,7 +356,6 @@ public class MatcherEngine : IMatcherEngine
 
         int n = words.Count;
 
-        // Union-Find with path compression
         int[] parent = Enumerable.Range(0, n).ToArray();
 
         int Find(int x)
@@ -316,8 +364,6 @@ public class MatcherEngine : IMatcherEngine
             return x;
         }
 
-        // Tiny epsilon absorbs IEEE-754 rounding when the true distance is
-        // exactly equal to the threshold (e.g. 0.15 represented as 0.15000...01).
         double threshold = proximityThreshold + 1e-9;
 
         for (int i = 0; i < n; i++)
@@ -332,19 +378,12 @@ public class MatcherEngine : IMatcherEngine
             }
         }
 
-        // Group all words by their root representative
         return Enumerable.Range(0, n)
             .GroupBy(i => Find(i))
             .Select(g => g.Select(i => words[i]).ToList())
             .ToList();
     }
 
-    /// <summary>
-    /// Euclidean distance between the centres of two OCR words in normalised
-    /// image-relative coordinates (both X and Y axes are 0–1).
-    /// Coordinates outside [0,1] are accepted as-is — clamping happens later
-    /// in the bbox-to-slide-points conversion.
-    /// </summary>
     private static double OcrWordCentreDistance(OcrWordInfo a, OcrWordInfo b)
     {
         double cx1 = a.X + a.Width  / 2.0;
@@ -354,15 +393,6 @@ public class MatcherEngine : IMatcherEngine
         return Math.Sqrt((cx2 - cx1) * (cx2 - cx1) + (cy2 - cy1) * (cy2 - cy1));
     }
 
-    /// <summary>
-    /// Returns the single best cluster from <paramref name="allMatched"/>:
-    /// <list type="number">
-    ///   <item>Most co-located matched words (largest cluster)</item>
-    ///   <item>Topmost (smallest min-Y) on a tie — reading order</item>
-    ///   <item>Leftmost (smallest min-X) on a further tie — reading order</item>
-    /// </list>
-    /// Trivial cases (0 or 1 words) are returned unchanged.
-    /// </summary>
     internal static List<OcrWordInfo> BestCluster(List<OcrWordInfo> allMatched)
     {
         if (allMatched == null || allMatched.Count == 0)
@@ -373,11 +403,10 @@ public class MatcherEngine : IMatcherEngine
 
         var clusters = ClusterByProximity(allMatched, OcrClusterProximityThreshold);
 
-        // clusters is always non-empty when allMatched is non-empty
         return clusters
-            .OrderByDescending(c => c.Count)                // 1. most co-located words
-            .ThenBy(c => c.Min(w => w.Y))                  // 2. topmost (reading order)
-            .ThenBy(c => c.Min(w => w.X))                  // 3. leftmost (reading order)
+            .OrderByDescending(c => c.Count)
+            .ThenBy(c => c.Min(w => w.Y))
+            .ThenBy(c => c.Min(w => w.X))
             .First();
     }
 }

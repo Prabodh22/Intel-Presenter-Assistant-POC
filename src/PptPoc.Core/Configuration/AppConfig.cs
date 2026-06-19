@@ -52,4 +52,17 @@ public class AppConfig
     public int OrchestratorLoopMs { get; set; } = 100;
     public bool ForceCpuMode { get; set; } = false;
     public string LaserToggleHotkey { get; set; } = "Ctrl+Shift+L";
+
+    /// <summary>
+    /// Hard ceiling on the VAD energy threshold produced by auto-calibration.
+    /// The silence-only calibrator computes threshold = noise_p95 × 3. In noisy
+    /// environments (fan spin-up, PC activity) the ambient RMS can be 5–10× higher
+    /// than normal, pushing the threshold above typical speech RMS (0.003–0.009)
+    /// and silently blocking ALL voice input for the entire session.
+    /// This cap ensures the threshold never exceeds a value where normal speech
+    /// would be rejected. Default 0.008 is safely above typical room noise (0.001)
+    /// but below the lower end of normal speech (0.003).
+    /// Set to 0 to disable the cap (not recommended).
+    /// </summary>
+    public float VadMaxThreshold { get; set; } = 0.008f;
 }

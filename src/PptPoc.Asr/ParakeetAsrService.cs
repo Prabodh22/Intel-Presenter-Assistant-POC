@@ -1,6 +1,7 @@
 ﻿using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using PptPoc.Core.Configuration;
 using PptPoc.Core.Interfaces;
 using PptPoc.Core.Models;
@@ -126,7 +127,7 @@ public sealed class ParakeetAsrService : IAsrService
         {
             Log.Warning(ex, "Parakeet model files appear corrupted despite size checks. Re-downloading all model files and retrying once.");
             DisposeOpenVinoHandles();
-            await Task.Delay(1000); // Add a delay to allow file handles to be released
+            await Task.Delay(1000);
 
             var retryBaseDir = Path.GetDirectoryName(modelDir) ?? modelDir;
             var retryDir = Path.Combine(retryBaseDir, $"parakeet_repair_{DateTime.UtcNow:yyyyMMddHHmmss}");
@@ -165,46 +166,58 @@ public sealed class ParakeetAsrService : IAsrService
         if (!IsReady || audioSamples.Length == 0)
             return new List<TranscriptChunk>();
 
-        // Run on the ThreadPool so the processing loop stays responsive during
-        // the 100-500ms OpenVINO inference.  _inferLock still prevents concurrent runs.
         return await Task.Run(() =>
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            lock (_inferLock)
+
+            // ── Gold Mine #6: Non-blocking inference lock ───────────────────
+            // If a previous inference is still running, return immediately instead
+            // of blocking the processing loop for 60-120ms. The next loop iteration
+            // will try again with a slightly larger audio window — no speech is lost.
+            if (!Monitor.TryEnter(_inferLock))
             {
-                try
-                {
-                    // Each call receives an overlapping audio window ΓÇö reset RNNT state.
-                    ResetState();
+                Log.Debug("ASR: Skipping — previous inference still running");
+                return new List<TranscriptChunk>();
+            }
 
-                    var mel = RunPreprocessor(audioSamples);
-                    var (enc, validFrames) = RunEncoder(mel);
-                    var tokenIds = DecodeGreedy(enc, validFrames);
-                    var text = NormalizeDecodedText(DecodeTokens(tokenIds));
+            try
+            {
+                // Each call receives an overlapping audio window — reset RNNT state.
+                ResetState();
 
-                    sw.Stop();
+                var mel = RunPreprocessor(audioSamples);
+                var (enc, validFrames) = RunEncoder(mel);
+                var tokenIds = DecodeGreedy(enc, validFrames);
+                var text = NormalizeDecodedText(DecodeTokens(tokenIds));
 
-                    if (string.IsNullOrWhiteSpace(text))
-                        return new List<TranscriptChunk>();
+                sw.Stop();
 
-                    Log.Debug("Parakeet transcribed in {Ms}ms: {Text}", sw.ElapsedMilliseconds, text);
-
-                    return new List<TranscriptChunk>
-                    {
-                        new()
-                        {
-                            Text = text,
-                            Start = TimeSpan.Zero,
-                            End = TimeSpan.FromSeconds(audioSamples.Length / (double)SampleRate),
-                            ReceivedAt = DateTime.UtcNow
-                        }
-                    };
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "Parakeet transcription failed");
+                if (string.IsNullOrWhiteSpace(text))
                     return new List<TranscriptChunk>();
-                }
+
+                Log.Debug("Parakeet transcribed in {Ms}ms: {Text}", sw.ElapsedMilliseconds, text);
+
+                var now = DateTime.UtcNow;
+                return new List<TranscriptChunk>
+                {
+                    new()
+                    {
+                        Text = text,
+                        Start = TimeSpan.Zero,
+                        End = TimeSpan.FromSeconds(audioSamples.Length / (double)SampleRate),
+                        ReceivedAt = now,
+                        OriginalSpeechAt = now  // Gold Mine #4: initial value; Orchestrator may override
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Parakeet transcription failed");
+                return new List<TranscriptChunk>();
+            }
+            finally
+            {
+                Monitor.Exit(_inferLock);
             }
         }).ConfigureAwait(false);
     }
@@ -319,7 +332,6 @@ public sealed class ParakeetAsrService : IAsrService
         }
         catch (OpenVINOException)
         {
-            // Some exported models have unnamed ports; fall back to index-based mapping.
             return null;
         }
     }
@@ -739,7 +751,6 @@ public sealed class ParakeetAsrService : IAsrService
 
         _core = new OVCore();
         
-        // Use a cache directory so OpenVINO compiles the model only once. Saves ~15 seconds on startup.
         var cacheDir = Path.Combine(modelDir, "cache");
         Directory.CreateDirectory(cacheDir);
         _core.SetDeviceProperty(device, "CACHE_DIR", cacheDir);
@@ -762,7 +773,6 @@ public sealed class ParakeetAsrService : IAsrService
         }
         catch (Exception ex)
         {
-            // Fallback to CPU if GPU device fails
             Log.Warning(ex, "Failed to initialize on device {Device}, falling back to CPU", device);
             actualDevice = "CPU";
             _encoderModel = _core.CompileModel(Path.Combine(modelDir, "parakeet_encoder.xml"), new DeviceOptions("CPU"));

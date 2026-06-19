@@ -21,7 +21,22 @@ public class DebounceManager
     private string? _currentElementId;
     private double _currentConfidence;
     private DateTime _currentHighlightStart = DateTime.MinValue;
-    private const double StickinessMargin = 0.10; // New element must beat current by this margin
+
+    // ── Fix #3: Decaying stickiness margin ───────────────────────────────────
+    // Instead of a flat margin for the entire stickiness window, the required
+    // margin to switch starts at MaxStickinessMargin and linearly decays to 0
+    // by the end of the window. This means:
+    // - At T=0 after highlight: hard to switch (need 0.15 margin)
+    // - At T=50%: moderate (need 0.075 margin)
+    // - At T=100%: free to switch (need 0 margin)
+    // This prevents "stuck" highlights while still damping rapid oscillation.
+    private const double MaxStickinessMargin = 0.15;
+
+    // ── Enhancement #8: Track whether current highlight is an image match ────
+    private bool _currentIsImageMatch;
+
+    // Image stickiness multiplier (1.2 = 20% longer hold for images)
+    private const double ImageStickinessMultiplier = 1.2;
 
     // Sliding window stability: element must appear N times in last K cycles
     private readonly Queue<string> _recentWinners = new();
@@ -37,8 +52,6 @@ public class DebounceManager
 
     /// <summary>
     /// Returns true if this element should be highlighted now.
-    /// Image matches require double the stability votes — they are more disruptive
-    /// when wrong, so a brief burst of speech should not trigger a highlight.
     /// </summary>
     public bool ShouldHighlight(string elementId, double confidence, PptPoc.Core.Models.MatchType matchType)
     {
@@ -51,10 +64,7 @@ public class DebounceManager
             _recentWinners.Dequeue();
         }
 
-        // ImageMatch needs 2x the stability votes — images are more disruptive when wrong
-        int requiredCycles = matchType == PptPoc.Core.Models.MatchType.ImageMatch
-            ? _config.StabilityRequiredCycles * 2
-            : _config.StabilityRequiredCycles;
+        int requiredCycles = _config.StabilityRequiredCycles;
 
         int votes = _recentWinners.Count(x => x == elementId);
         if (votes < requiredCycles)
@@ -64,23 +74,43 @@ public class DebounceManager
             return false;
         }
 
-        // If this exact element was already highlighted recently, SKIP it — don't keep re-triggering the laser.
+        // If this exact element was already highlighted recently, SKIP it
         if (_lastHighlightTime.TryGetValue(elementId, out var lastTime) && (now - lastTime).TotalMilliseconds < _config.CooldownMs)
         {
             return false;
         }
 
-        // Stickiness: if switching to a DIFFERENT element while the current one is still "alive",
-        // require the new element to beat it by a meaningful margin to prevent oscillation.
-        if (_currentElementId != null && _currentElementId != elementId
-            && (now - _currentHighlightStart).TotalMilliseconds < _config.HighlightDurationMs + _config.CooldownMs)
+        // ── Fix #3: Decaying stickiness ─────────────────────────────────────
+        // Compute the stickiness window duration
+        double stickyDurationMs = _config.HighlightDurationMs + _config.CooldownMs;
+        if (_currentIsImageMatch)
+            stickyDurationMs *= ImageStickinessMultiplier;
+
+        if (_currentElementId != null && _currentElementId != elementId)
         {
-            if (confidence < _currentConfidence + StickinessMargin)
+            double elapsedMs = (now - _currentHighlightStart).TotalMilliseconds;
+
+            if (elapsedMs < stickyDurationMs)
             {
-                Log.Debug("Stickiness: {NewElement} ({NewConf:F2}) not enough margin over current {CurElement} ({CurConf:F2})",
-                    elementId, confidence, _currentElementId, _currentConfidence);
-                return false;
+                // Linear decay: full margin at T=0, zero margin at T=stickyDuration
+                double decayFactor = Math.Max(0.0, 1.0 - elapsedMs / stickyDurationMs);
+                double requiredMargin = MaxStickinessMargin * decayFactor;
+
+                if (confidence < _currentConfidence + requiredMargin)
+                {
+                    Log.Debug("Stickiness{ImageTag}: {NewElement} ({NewConf:F2}) needs +{Margin:F3} margin over {CurElement} ({CurConf:F2}), elapsed={ElapsedMs:F0}/{StickyMs:F0}ms",
+                        _currentIsImageMatch ? " (image)" : "",
+                        elementId, confidence, requiredMargin, _currentElementId, _currentConfidence,
+                        elapsedMs, stickyDurationMs);
+                    return false;
+                }
+                else
+                {
+                    Log.Debug("Stickiness overcome: {NewElement} ({NewConf:F2}) beat {CurElement} ({CurConf:F2}) with decayed margin {Margin:F3}",
+                        elementId, confidence, _currentElementId, _currentConfidence, requiredMargin);
+                }
             }
+            // else: stickiness window expired — free to switch
         }
 
         // Global cooldown check for switching to a NEW element
@@ -96,23 +126,23 @@ public class DebounceManager
     /// <summary>
     /// Records that a highlight was applied for this element.
     /// </summary>
-    public void RecordHighlight(string elementId, double confidence = 1.0)
+    public void RecordHighlight(string elementId, double confidence = 1.0,
+        PptPoc.Core.Models.MatchType matchType = PptPoc.Core.Models.MatchType.TextMatch)
     {
         var now = _clock();
         _lastHighlightTime[elementId] = now;
         _lastGlobalHighlight = now;
 
         // Only reset stickiness timer when switching to a DIFFERENT element.
-        // Re-highlighting the same element should NOT extend the stickiness window,
-        // otherwise transitions to other elements are blocked indefinitely.
         if (_currentElementId != elementId)
         {
             _currentElementId = elementId;
             _currentHighlightStart = now;
         }
         _currentConfidence = confidence;
+        _currentIsImageMatch = matchType == PptPoc.Core.Models.MatchType.ImageMatch;
 
-        Log.Debug("Recorded highlight for {ElementId}", elementId);
+        Log.Debug("Recorded highlight for {ElementId} (type={MatchType})", elementId, matchType);
     }
 
     public void Reset()
@@ -123,5 +153,6 @@ public class DebounceManager
         _currentElementId = null;
         _currentConfidence = 0;
         _currentHighlightStart = DateTime.MinValue;
+        _currentIsImageMatch = false;
     }
 }

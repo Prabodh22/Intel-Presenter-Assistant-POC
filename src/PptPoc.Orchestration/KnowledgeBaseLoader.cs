@@ -20,6 +20,12 @@ public class KnowledgeBaseLoader
     public string? PresentationName => _kb?.Presentation;
     public int SlideCount => _snapshots?.Count ?? 0;
 
+    /// <summary>
+    /// The full path of the YAML file currently loaded.
+    /// Used by the Orchestrator to detect stale KB after a PPT switch.
+    /// </summary>
+    public string? LoadedYamlPath { get; private set; }
+
     public void Load(string yamlPath)
     {
         if (!File.Exists(yamlPath))
@@ -90,8 +96,35 @@ public class KnowledgeBaseLoader
             _snapshots[slideKb.Index] = snapshot;
         }
 
+        LoadedYamlPath = yamlPath;
         Log.Information("Loaded KB '{Presentation}' with {Count} slides (preprocessed {At})",
             _kb.Presentation, _snapshots.Count, _kb.PreprocessedAt);
+    }
+
+    /// <summary>
+    /// Hot-reloads the KB from a different YAML file without restarting the app.
+    /// Called when the Orchestrator detects the active presentation has changed mid-session.
+    /// If the YAML file does not exist yet (not preprocessed), logs a warning and leaves
+    /// the existing KB intact so matching degrades gracefully rather than hard-failing.
+    /// </summary>
+    public bool Reload(string newYamlPath)
+    {
+        if (!File.Exists(newYamlPath))
+        {
+            Log.Warning("KB hot-reload skipped — YAML not found for new presentation: {Path}", newYamlPath);
+            return false;
+        }
+
+        Log.Information("KB hot-reload: switching from '{Old}' to '{New}'",
+            LoadedYamlPath ?? "(none)", newYamlPath);
+
+        // Clear existing state before loading new KB
+        _snapshots = null;
+        _kb = null;
+        LoadedYamlPath = null;
+
+        Load(newYamlPath);
+        return true;
     }
 
     /// <summary>
