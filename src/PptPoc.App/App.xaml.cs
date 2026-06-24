@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows;
 using PptPoc.Core.Configuration;
 using PptPoc.Orchestration;
@@ -26,8 +26,25 @@ public partial class App : Application
     private Orchestrator? _orchestrator;
     private KnowledgeBasePreprocessor? _kbPreprocessor;
     private IPowerPointService? _pptService;
+
+    // ── API Preflight ─────────────────────────────────────────────────────────
+    // Stored so the "Start Engine" tray handler can call PingAsync() before
+    // PreprocessAsync(). If the ping fails, the start is aborted with a clear
+    // user-facing message rather than a silent KB degradation (all slides fail
+    // → zero matching for the entire session).
+    private IOpenAIVisionService? _visionService;
+
     private ToolStripMenuItem? _startMenuItem;
     private ToolStripMenuItem? _stopMenuItem;
+
+    // ── Refresh KB menu item ──────────────────────────────────────────────────
+    // Allows the user to force a KB rebuild at any time without restarting the
+    // app. This is the manual override for the case where IsYamlStale() could
+    // not detect staleness automatically (e.g. SharePoint / COM-title-only path).
+    // It also acts as the one-click fix if a presenter edits slides right before
+    // the talk and wants the KB to reflect the final version.
+    private ToolStripMenuItem? _refreshMenuItem;
+
     private StatusIndicatorWindow? _statusIndicator;
 
     protected override async void OnStartup(StartupEventArgs e)
@@ -113,8 +130,45 @@ public partial class App : Application
         { 
             try 
             {
-                if (_pptService != null && _kbPreprocessor != null)
+                if (_pptService != null && _kbPreprocessor != null && _visionService != null)
                 {
+                    // ── Step 1: API Preflight Ping ────────────────────────────────────
+                    // Before spending time preprocessing all slides (which calls the Vision
+                    // API once per slide), verify the endpoint is reachable and the token
+                    // is valid. A 1-token text call costs ~0 and completes in <2s.
+                    // If it fails we surface a specific error immediately instead of
+                    // letting the user wait through preprocessing only to get zero results.
+                    _notifyIcon.Text = "PPT Highlighting Engine (Checking API...)";
+                    _statusIndicator?.UpdateStatus("Checking API...");
+                    Log.Information("API preflight ping starting...");
+
+                    bool apiOk = await _visionService.PingAsync();
+                    if (!apiOk)
+                    {
+                        var currentToken = Environment.GetEnvironmentVariable("GNAI_TOKEN") ?? string.Empty;
+                        string detail = string.IsNullOrWhiteSpace(currentToken)
+                            ? "GNAI_TOKEN is not set.\n\nUse 'Update GNAI Token' in the tray menu to enter your token."
+                            : "The API endpoint is unreachable or returned an auth/server error.\n\n" +
+                              "• Check that you are on the Intel network or VPN\n" +
+                              "• Verify your GNAI_TOKEN is correct (use 'Update GNAI Token')\n" +
+                              "• Check the log file for the exact HTTP status code";
+
+                        Log.Error("API preflight ping failed — aborting engine start.");
+                        System.Windows.MessageBox.Show(
+                            $"API connectivity check failed — engine not started.\n\n{detail}",
+                            "API Not Reachable",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+
+                        UpdateMenuState(false);
+                        _statusIndicator?.UpdateStatus("Paused");
+                        _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
+                        return;
+                    }
+
+                    Log.Information("API preflight ping passed — proceeding to knowledge base build.");
+
+                    // ── Step 2: Attach to PowerPoint ──────────────────────────────────
                     _notifyIcon.Text = "PPT Highlighting Engine (Analyzing Slides...)";
                     _statusIndicator?.UpdateStatus("Building KB");
                     Log.Information("Manual start triggered. Analyzing slides into YAML...");
@@ -124,9 +178,16 @@ public partial class App : Application
                         throw new Exception("Could not attach to a running PowerPoint instance.");
                     }
 
+                    // ── Step 3: Preprocess slides into KB ─────────────────────────────
+                    // KnowledgeBasePreprocessor.PreprocessAsync now performs a staleness
+                    // check automatically:
+                    //   • YAML missing             → build from scratch
+                    //   • YAML up to date          → return instantly (no API calls)
+                    //   • YAML stale (PPT edited)  → delete old YAML and rebuild
                     await _kbPreprocessor.PreprocessAsync(_pptService, "knowledge_base.yaml");
                 }
                 
+                // ── Step 4: Start the processing loop ─────────────────────────────────
                 if (_orchestrator != null) 
                 {
                     await _orchestrator.StartAsync(); 
@@ -152,11 +213,126 @@ public partial class App : Application
             }
         });
 
+        // ── Refresh Knowledge Base ────────────────────────────────────────────
+        // Deletes the cached YAML for the currently open deck and rebuilds it
+        // from scratch. Use this when:
+        //   • Slides were edited and the auto-staleness check couldn't detect it
+        //     (SharePoint / COM-title-only path where file-time comparison is
+        //     unavailable)
+        //   • You want to force a clean rebuild regardless of file times
+        //
+        // If the engine is currently running, it is stopped first, the KB is
+        // rebuilt, and then the engine is automatically restarted — so the user
+        // gets a seamless "refresh and keep going" experience.
+        _refreshMenuItem = new ToolStripMenuItem("Refresh Knowledge Base", null, async (s, e) =>
+        {
+            try
+            {
+                if (_pptService == null || _kbPreprocessor == null || _visionService == null || _orchestrator == null)
+                    return;
+
+                bool wasRunning = _orchestrator.IsRunning;
+
+                // ── Step 1: Stop engine if it is currently running ─────────────
+                if (wasRunning)
+                {
+                    Log.Information("Refresh KB: stopping engine before rebuild...");
+                    await _orchestrator.StopAsync();
+                    UpdateMenuState(false);
+                }
+
+                // ── Step 2: Attach to PowerPoint (needed to read the PPT path) ─
+                if (!_pptService.TryAttach())
+                {
+                    System.Windows.MessageBox.Show(
+                        "Could not attach to a running PowerPoint instance.\n\nMake sure PowerPoint is open before refreshing.",
+                        "Refresh Failed",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    if (wasRunning) UpdateMenuState(false);
+                    return;
+                }
+
+                // ── Step 3: Delete the existing YAML so PreprocessAsync rebuilds ─
+                // GetActivePresentationPath gives the real on-disk path;
+                // GetYamlPath normalises it to the canonical YAML filename.
+                string? pptPath = _pptService.GetActivePresentationPath();
+                if (pptPath != null)
+                {
+                    string yamlPath = KbPathHelper.GetYamlPath(pptPath);
+                    if (System.IO.File.Exists(yamlPath))
+                    {
+                        System.IO.File.Delete(yamlPath);
+                        Log.Information("Refresh KB: deleted stale YAML at {Path}", yamlPath);
+                    }
+                }
+
+                // ── Step 4: API preflight ping ─────────────────────────────────
+                _notifyIcon!.Text = "PPT Highlighting Engine (Checking API...)";
+                _statusIndicator?.UpdateStatus("Checking API...");
+
+                bool apiOk = await _visionService.PingAsync();
+                if (!apiOk)
+                {
+                    Log.Error("Refresh KB: API preflight ping failed.");
+                    System.Windows.MessageBox.Show(
+                        "API connectivity check failed — knowledge base not rebuilt.\n\n" +
+                        "Check that you are on the Intel network or VPN and that your GNAI_TOKEN is valid.",
+                        "API Not Reachable",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
+                    _statusIndicator?.UpdateStatus("Paused");
+                    return;
+                }
+
+                // ── Step 5: Rebuild KB ─────────────────────────────────────────
+                _notifyIcon.Text = "PPT Highlighting Engine (Rebuilding KB...)";
+                _statusIndicator?.UpdateStatus("Rebuilding KB...");
+                Log.Information("Refresh KB: rebuilding knowledge base from scratch...");
+
+                await _kbPreprocessor.PreprocessAsync(_pptService, "knowledge_base.yaml");
+
+                Log.Information("Refresh KB: rebuild complete.");
+
+                // ── Step 6: Restart engine if it was running before ────────────
+                if (wasRunning)
+                {
+                    Log.Information("Refresh KB: restarting engine...");
+                    await _orchestrator.StartAsync();
+                    UpdateMenuState(true);
+                    _statusIndicator?.Dispatcher.Invoke(() => _statusIndicator.Show());
+                    _notifyIcon.Text = "PPT Highlighting Engine (Running)";
+                    _notifyIcon.ShowBalloonTip(3000, "Knowledge Base Refreshed",
+                        "KB rebuilt successfully. Engine is running with the updated slides.", ToolTipIcon.Info);
+                }
+                else
+                {
+                    UpdateMenuState(false);
+                    _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
+                    _notifyIcon.ShowBalloonTip(3000, "Knowledge Base Refreshed",
+                        "KB rebuilt successfully. Click 'Start Engine' when ready.", ToolTipIcon.Info);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Refresh KB: failed.");
+                System.Windows.MessageBox.Show(
+                    "Knowledge base refresh failed.\n\nError: " + ex.Message,
+                    "Refresh Error",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                UpdateMenuState(false);
+            }
+        });
+
         _startMenuItem.Enabled = false;
         _stopMenuItem.Enabled = false;
+        _refreshMenuItem.Enabled = false;
 
         contextMenu.Items.Add(_startMenuItem);
         contextMenu.Items.Add(_stopMenuItem);
+        contextMenu.Items.Add(_refreshMenuItem);
         
         contextMenu.Items.Add(new ToolStripSeparator());
         contextMenu.Items.Add("Exit", null, (s, e) => 
@@ -180,9 +356,14 @@ public partial class App : Application
 
     private void UpdateMenuState(bool isRunning)
     {
-        if (_startMenuItem != null) _startMenuItem.Enabled = !isRunning;
-        if (_stopMenuItem != null) _stopMenuItem.Enabled = isRunning;
-        if (_notifyIcon != null) _notifyIcon.Text = isRunning ? "PPT Highlighting Engine (Running)" : "PPT Highlighting Engine (Stopped)";
+        if (_startMenuItem != null)   _startMenuItem.Enabled   = !isRunning;
+        if (_stopMenuItem != null)    _stopMenuItem.Enabled    = isRunning;
+        // Refresh is enabled whenever the engine is NOT mid-start and the services
+        // are initialised — regardless of running state.
+        if (_refreshMenuItem != null) _refreshMenuItem.Enabled = true;
+        if (_notifyIcon != null)      _notifyIcon.Text         = isRunning
+            ? "PPT Highlighting Engine (Running)"
+            : "PPT Highlighting Engine (Stopped)";
     }
 
     private Icon CreatePocIcon()
@@ -226,8 +407,9 @@ public partial class App : Application
             splash.UpdateProgress(100, "Checking Semantic matching models...");
             await semanticService.InitializeAsync(config.SemanticModelPath);
 
-            // Store references for the start button
+            // Store references for the start button and refresh button
             _pptService = pptService;
+            _visionService = gptVision;   // stored for PingAsync() in Start Engine + Refresh handlers
             _kbPreprocessor = new KnowledgeBasePreprocessor(config, slideReader, semanticService, gptVision);
 
             var transcriptProcessor = new TranscriptProcessor(config);
@@ -270,6 +452,7 @@ public partial class App : Application
 
             Log.Information("Engine successfully initialized via Tray. Waiting for manual start.");
             
+            // Enable the tray buttons now that services are fully initialised.
             // Do NOT auto-start to prevent PowerPoint errors on boot.
             UpdateMenuState(false);
         }
@@ -296,4 +479,3 @@ public partial class App : Application
         base.OnExit(e);
     }
 }
-

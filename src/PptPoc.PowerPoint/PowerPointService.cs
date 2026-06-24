@@ -31,6 +31,32 @@ public class PowerPointService : IPowerPointService
             _app = null;
             return false;
         }
+        catch (InvalidCastException ex)
+        {
+            // GetActiveObject returned an object that can't be cast to Ppt.Application.
+            // This can happen if a stale COM registration is present in the ROT.
+            Log.Warning(ex, "GetActiveObject returned a stale COM reference — PowerPoint may have just restarted");
+            _app = null;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Force-releases the current (potentially stale) COM reference and tries
+    /// to re-attach to whichever PowerPoint instance is currently running.
+    /// Call this when IsConnected is true but COM calls keep throwing
+    /// InvalidCastException, which indicates the RCW has gone stale.
+    /// </summary>
+    public bool TryReattach()
+    {
+        Log.Information("TryReattach: releasing stale COM reference and re-attaching to PowerPoint");
+        if (_app != null)
+        {
+            try { Marshal.ReleaseComObject(_app); }
+            catch (Exception ex) { Log.Debug(ex, "ReleaseComObject on stale _app"); }
+            _app = null;
+        }
+        return TryAttach();
     }
 
     /// <summary>
@@ -80,6 +106,11 @@ public class PowerPointService : IPowerPointService
             Log.Warning(ex, "Failed to get active slide index");
             return -1;
         }
+        catch (InvalidCastException)
+        {
+            // GetActiveSlide() already nulls _app and logs; just return -1 here.
+            return -1;
+        }
     }
 
     public int GetSlideIndexFromComObject(object slideComObject)
@@ -104,6 +135,10 @@ public class PowerPointService : IPowerPointService
         catch (COMException ex)
         {
             Log.Warning(ex, "Failed to get active slide COM object");
+            return null;
+        }
+        catch (InvalidCastException)
+        {
             return null;
         }
     }
@@ -132,6 +167,12 @@ public class PowerPointService : IPowerPointService
 
             return pres.Slides[slideIndex];
         }
+        catch (InvalidCastException ex)
+        {
+            Log.Warning(ex, "COM RCW stale in GetSlideByIndex — marking disconnected");
+            _app = null;
+            return null;
+        }
         catch (COMException ex)
         {
             Log.Warning(ex, "Failed to get slide by index {Index}", slideIndex);
@@ -139,18 +180,53 @@ public class PowerPointService : IPowerPointService
         }
     }
 
+    /// <summary>
+    /// Core internal method that resolves the currently active PowerPoint slide.
+    /// ALL public methods that need the current slide funnel through here.
+    ///
+    /// Bug fix: Previously this method was unguarded. Any COM call on a stale
+    /// _app RCW throws System.InvalidCastException (not COMException) deep inside
+    /// StubHelpers.GetCOMIPFromRCW. That exception escaped all the public callers
+    /// (which only caught COMException), reached ProcessingLoopAsync's generic
+    /// catch, was logged, and the loop continued — causing ~20 exceptions/second
+    /// hammering for the entire session (13+ hours, 331MB log, severe CPU lag,
+    /// tool completely non-functional).
+    ///
+    /// Fix: catch InvalidCastException here, null _app so IsConnected returns
+    /// false, and return null. The Orchestrator detects IsConnected==false and
+    /// calls TryReattach() with exponential backoff.
+    /// </summary>
     private Ppt.Slide? GetActiveSlide()
     {
         if (_app == null)
             return null;
 
-        // Prefer slideshow view when presenting.
-        if (_app.SlideShowWindows.Count > 0)
+        try
         {
-            return _app.SlideShowWindows[1].View?.Slide as Ppt.Slide;
-        }
+            // Prefer slideshow view when presenting.
+            if (_app.SlideShowWindows.Count > 0)
+            {
+                return _app.SlideShowWindows[1].View?.Slide as Ppt.Slide;
+            }
 
-        return _app.ActiveWindow?.View?.Slide as Ppt.Slide;
+            return _app.ActiveWindow?.View?.Slide as Ppt.Slide;
+        }
+        catch (InvalidCastException ex)
+        {
+            // The RCW for _app is stale — PowerPoint was likely closed/reopened
+            // or a different instance replaced the one we attached to.
+            // Null _app so subsequent calls short-circuit and the Orchestrator
+            // knows to reconnect.
+            Log.Warning(ex, "COM RCW for PowerPoint Application is stale — marking disconnected. " +
+                            "Orchestrator will attempt TryReattach().");
+            _app = null;
+            return null;
+        }
+        catch (COMException ex)
+        {
+            Log.Warning(ex, "COMException in GetActiveSlide");
+            return null;
+        }
     }
 
     public object? GetActivePresentationComObject()
@@ -162,6 +238,12 @@ public class PowerPointService : IPowerPointService
         catch (COMException ex)
         {
             Log.Warning(ex, "Failed to get active presentation");
+            return null;
+        }
+        catch (InvalidCastException ex)
+        {
+            Log.Warning(ex, "COM RCW stale in GetActivePresentationComObject — marking disconnected");
+            _app = null;
             return null;
         }
     }
@@ -187,6 +269,12 @@ public class PowerPointService : IPowerPointService
 
             return _app.ActivePresentation?.FullName;
         }
+        catch (InvalidCastException ex)
+        {
+            Log.Warning(ex, "COM RCW stale in GetActivePresentationPath — marking disconnected");
+            _app = null;
+            return null;
+        }
         catch (COMException ex)
         {
             Log.Warning(ex, "Failed to get active presentation path");
@@ -200,6 +288,12 @@ public class PowerPointService : IPowerPointService
         {
             if (_app == null) return false;
             return _app.SlideShowWindows.Count > 0;
+        }
+        catch (InvalidCastException ex)
+        {
+            Log.Warning(ex, "COM RCW stale in IsSlideShowRunning — marking disconnected");
+            _app = null;
+            return false;
         }
         catch (COMException)
         {
@@ -280,6 +374,11 @@ public class PowerPointService : IPowerPointService
                 RestoreSlideShowWindowFocus();
             }
         }
+        catch (InvalidCastException ex)
+        {
+            Log.Warning(ex, "COM RCW stale in NextSlide — marking disconnected");
+            _app = null;
+        }
         catch (Exception ex)
         {
             Log.Warning(ex, "Failed to navigate to next slide");
@@ -295,6 +394,11 @@ public class PowerPointService : IPowerPointService
                 _app.SlideShowWindows[1].View.Previous();
                 RestoreSlideShowWindowFocus();
             }
+        }
+        catch (InvalidCastException ex)
+        {
+            Log.Warning(ex, "COM RCW stale in PreviousSlide — marking disconnected");
+            _app = null;
         }
         catch (Exception ex)
         {

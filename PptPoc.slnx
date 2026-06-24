@@ -12,5 +12,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/PptPoc.Matching.Tests/PptPoc.Matching.Tests.csproj" />
     <Project Path="tests/PptPoc.Orchestration.Tests/PptPoc.Orchestration.Tests.csproj" />
+    <Project Path="tests/PptPoc.Vision.Tests/PptPoc.Vision.Tests.csproj" />
   </Folder>
 </Solution>

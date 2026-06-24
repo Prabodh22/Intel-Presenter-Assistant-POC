@@ -20,6 +20,20 @@ public class KnowledgeBasePreprocessor
     private readonly IOpenAIVisionService? _gptVision;
     private readonly AppConfig _config;
 
+    /// <summary>
+    /// Base directory where YAML knowledge-base files are stored and looked up.
+    /// Delegates to <see cref="KbPathHelper.DefaultKbDirectory"/> which defaults
+    /// to <see cref="AppContext.BaseDirectory"/> (the exe's own folder), making
+    /// the path absolute and consistent regardless of working directory.
+    /// Override in tests to point at a temp folder (also set
+    /// <see cref="KbPathHelper.DefaultKbDirectory"/> for the helper).
+    /// </summary>
+    public string KbBaseDirectory
+    {
+        get => KbPathHelper.DefaultKbDirectory;
+        set => KbPathHelper.DefaultKbDirectory = value;
+    }
+
     public event Action<int, int>? SlideProgress; // (current, total)
 
     public KnowledgeBasePreprocessor(
@@ -37,6 +51,17 @@ public class KnowledgeBasePreprocessor
     /// <summary>
     /// Pre-process all slides in the active presentation and save as YAML.
     /// Must be called from STA thread with PowerPoint COM access.
+    ///
+    /// Cache behaviour
+    /// ───────────────
+    /// • YAML does not exist           → build from scratch (first run)
+    /// • YAML exists and is up to date → return immediately (instant, no API calls)
+    /// • YAML exists but is stale      → delete old YAML, rebuild
+    ///   Staleness is determined by <see cref="KbPathHelper.IsYamlStale"/>:
+    ///   if the .pptx file on disk was modified more than 30 seconds after the
+    ///   YAML was last written, the KB is considered stale and is rebuilt.
+    ///   For COM-title-only paths (SharePoint / AutoRecovered), the YAML is
+    ///   always treated as current — use the "Refresh KB" tray item to force.
     /// </summary>
     public async Task<string> PreprocessAsync(
         IPowerPointService pptService,
@@ -51,14 +76,54 @@ public class KnowledgeBasePreprocessor
         int totalSlides = presentation.Slides.Count;
         string pptFullName = presentation.FullName;
         string pptName = System.IO.Path.GetFileName(pptFullName);
-        
-        string safeName = System.Text.RegularExpressions.Regex.Replace(pptFullName, "[^a-zA-Z0-9_.-]", "_");
-        outputPath = $"knowledge_base_{safeName}.yaml";
+
+        // ── Canonical YAML path ───────────────────────────────────────────────
+        // Use KbPathHelper so the save-path key EXACTLY matches the lookup key
+        // used by Orchestrator.ProcessingLoopAsync on hot-reload.
+        //
+        // Root cause of cache miss (2026-06-23 session):
+        //   presentation.FullName when auto-recovered returns a title string
+        //   ("llm_accuracy_deep_dive.pptx - AutoRecovered") while
+        //   GetActivePresentationPath() returns the real file path
+        //   ("C:\Users\1\Documents\llm_accuracy_deep_dive [Autosaved].pptx").
+        //   Without normalisation these produce different safe names → the YAML
+        //   saved here is never found by the hot-reload → full reprocess every run.
+        //
+        // KbPathHelper.GetYamlPath() fixes this by:
+        //   1. Taking Path.GetFileName() — strips directory components.
+        //   2. Stripping all known AutoRecovered/Autosaved suffix variants.
+        //   3. Sanitising with [^a-zA-Z0-9_.-] → '_'.
+        //   4. Prepending KbPathHelper.DefaultKbDirectory (AppContext.BaseDirectory).
+        outputPath = KbPathHelper.GetYamlPath(pptFullName);
+
+        // ── Staleness check ───────────────────────────────────────────────────
+        // Compare the YAML's last-write time against the .pptx file's last-write
+        // time. If the presentation was edited and autosaved after the KB was
+        // built, the old YAML is stale and would produce wrong/missing highlights
+        // for any slides that were added or changed since the last build.
+        //
+        // A 30-second grace window is applied by IsYamlStale so that background
+        // AutoSave flushes during a live session do not trigger a rebuild.
+        //
+        // For COM-title-only identifiers (SharePoint / "- AutoRecovered" forms),
+        // IsYamlStale returns false (cannot compare file times) — the YAML is
+        // treated as current. Use the "Refresh Knowledge Base" tray item to force.
+        bool isStale = KbPathHelper.IsYamlStale(pptFullName, outputPath);
+
+        if (!isStale)
+        {
+            Log.Information("Using cached YAML for {Presentation} (up to date): {Path}", pptName, outputPath);
+            return outputPath;
+        }
 
         if (System.IO.File.Exists(outputPath))
         {
-            Log.Information("Using cached YAML for {Presentation}: {Path}", pptName, outputPath);
-            return outputPath;
+            // YAML exists but the deck has been edited since it was built — delete
+            // the stale copy and fall through to a full rebuild below.
+            Log.Information(
+                "Cached YAML is stale (PPT modified after last KB build) — rebuilding KB for {Presentation}",
+                pptName);
+            System.IO.File.Delete(outputPath);
         }
 
         Log.Information("Pre-processing {SlideCount} slides from {Presentation}", totalSlides, pptName);
@@ -195,6 +260,12 @@ public class KnowledgeBasePreprocessor
             .Build();
 
         var yaml = serializer.Serialize(kb);
+
+        // Ensure the output directory exists (e.g. first run of published exe)
+        var dir = System.IO.Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(dir))
+            System.IO.Directory.CreateDirectory(dir);
+
         await File.WriteAllTextAsync(outputPath, yaml, ct);
 
         Log.Information("Knowledge base saved to {Path} ({SlideCount} slides, {Size} bytes)",

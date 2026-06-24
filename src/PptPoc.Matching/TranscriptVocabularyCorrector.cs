@@ -9,6 +9,12 @@ public static class TranscriptVocabularyCorrector
     // "off" and "of" share Soundex O100 — without protection, "laser off" becomes
     // "laser of" when the slide contains text like "state of the art".
     // Similarly "on", "next", "previous" etc. must survive unchanged.
+    //
+    // NOTE: "back" is in this list to prevent "go back" from being corrupted.
+    // However the 2-token merge check runs BEFORE the protected-word guard, so
+    // "back end" → "backend" still merges correctly when "backend" is in the
+    // slide vocabulary. A protected token is only preserved as-is when the merge
+    // check finds nothing worth merging into.
     private static readonly HashSet<string> ProtectedWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "on", "off", "next", "previous", "prev", "back", "laser", "slide",
@@ -36,14 +42,19 @@ public static class TranscriptVocabularyCorrector
 
         for (int index = 0; index < tokens.Count; index++)
         {
-            // ── Skip protected command words entirely ────────────────────────
-            if (ProtectedWords.Contains(tokens[index]))
-            {
-                corrected.Add(tokens[index]);
-                continue;
-            }
-
-            // --- 3-token merge (e.g. "deep sea carbon" → "deepseekcarbon" is unlikely, but "deep seek" → "deepseek") ---
+            // ── 2-token merge check — runs BEFORE the protected-word guard ───────
+            // This allows protected tokens like "back" to still merge with the next
+            // word when the compound ("backend") exists in the slide vocabulary.
+            //
+            // Guard: the NEXT token must not be a protected command word, so that
+            // "laser off", "go back", "next slide" etc. are never accidentally fused.
+            //
+            // Examples:
+            //   "back end"   + vocab "backend"   → "backend"   ✅  (fix: back is protected but merge runs first)
+            //   "open vino"  + vocab "openvino"  → "openvino"  ✅
+            //   "state full" + vocab "stateful"  → "stateful"  ✅  (statefull ≈ stateful, sim=0.889 > 0.84)
+            //   "laser off"  → "laseroff" not in vocab → falls through → "laser" protected → preserved ✅
+            //   "go back"    → "goback"   not in vocab → falls through → "go"    protected → preserved ✅
             if (index + 1 < tokens.Count && !ProtectedWords.Contains(tokens[index + 1]))
             {
                 var mergedToken = tokens[index] + tokens[index + 1];
@@ -53,6 +64,13 @@ public static class TranscriptVocabularyCorrector
                     index++;
                     continue;
                 }
+            }
+
+            // ── Skip protected command words entirely (no single-token correction) ─
+            if (ProtectedWords.Contains(tokens[index]))
+            {
+                corrected.Add(tokens[index]);
+                continue;
             }
 
             // --- Single-token correction via Levenshtein + phonetic fallback ---

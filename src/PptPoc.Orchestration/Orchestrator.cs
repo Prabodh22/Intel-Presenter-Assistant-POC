@@ -90,6 +90,14 @@ public class Orchestrator : IOrchestrator
     // slide context from matching on the new slide.
     private bool _discardNextAsrResult;
 
+    // ── COM Staleness Recovery ────────────────────────────────────────────────
+    // Tracks consecutive iterations where PowerPointService.IsConnected is false,
+    // which signals that the COM RCW for the PowerPoint Application object has
+    // gone stale (PowerPoint was closed/reopened or replaced by another instance).
+    // Used to drive exponential backoff + TryReattach() + auto-stop behaviour.
+    // See PowerPointService.GetActiveSlide() for how staleness is detected.
+    private int _consecutiveComFailures;
+
     // COM interop calls must execute on the UI STA context.
     private SynchronizationContext? _uiContext;
 
@@ -308,6 +316,7 @@ public class Orchestrator : IOrchestrator
         _samplesReceivedTotal = 0;
         _lastTranscribedSampleTotal = 0;
         _consecutiveSilenceSkips = 0;
+        _consecutiveComFailures = 0;
         _discardNextAsrResult = false;
         _processingTask = null;
         _cts?.Dispose();
@@ -398,9 +407,21 @@ public class Orchestrator : IOrchestrator
 
                     if (_kbLoader != null)
                     {
-                        // Same sanitisation formula as KnowledgeBasePreprocessor.PreprocessAsync
-                        string safeName = Regex.Replace(currentPptPath, "[^a-zA-Z0-9_.-]", "_");
-                        string yamlPath = $"knowledge_base_{safeName}.yaml";
+                        // ── Use KbPathHelper so the key EXACTLY matches what KnowledgeBasePreprocessor
+                        // saved. Root cause of cache miss in 2026-06-23 session:
+                        //
+                        //   Preprocessor used presentation.FullName which, when auto-recovered,
+                        //   returns a title like "llm_accuracy_deep_dive.pptx - AutoRecovered".
+                        //   Orchestrator used GetActivePresentationPath() which returns the real
+                        //   file path "C:\Users\1\Documents\llm_accuracy_deep_dive [Autosaved].pptx".
+                        //   These produce completely different safe-names → YAML never found →
+                        //   full 2-minute re-preprocessing every single session.
+                        //
+                        // KbPathHelper.GetYamlPath() fixes both:
+                        //   1. Strips AutoRecovered/Autosaved suffix from whatever form it's in.
+                        //   2. Uses Path.GetFileName() so only the bare name is keyed (no path).
+                        //   3. Prepends AppContext.BaseDirectory (same default as preprocessor).
+                        string yamlPath = KbPathHelper.GetYamlPath(currentPptPath);
 
                         bool reloaded = _kbLoader.Reload(yamlPath);
                         if (reloaded)
@@ -434,6 +455,76 @@ public class Orchestrator : IOrchestrator
 
                 // Handle slide changes explicitly in the loop
                 int currentSlideIndex = _pptService.GetActiveSlideIndex();
+
+                // ── COM Staleness Recovery ────────────────────────────────────────
+                // PowerPointService.GetActiveSlide() catches InvalidCastException
+                // (which signals a stale COM RCW) and nulls _app, making IsConnected
+                // false. We detect that here and attempt automatic self-healing.
+                //
+                // Root cause of Bug filed 2026-06-22:
+                //   The director's session produced a 331MB log (13+ hours) because
+                //   the COM object was stale from the very first tick. Every 50ms the
+                //   loop threw InvalidCastException, logged it, and continued — 20
+                //   errors/second, severe CPU lag, tool completely non-functional, and
+                //   the only recovery was to reinstall/restart the app.
+                //
+                // Fix strategy:
+                //   1. Attempt TryReattach() on first failure (immediate reconnect).
+                //   2. Exponential backoff (up to 5 s) on repeated failures to stop
+                //      hammering the COM layer and the log file.
+                //   3. Retry TryReattach() every 5 failures.
+                //   4. After 20 consecutive failures, auto-stop the engine and show
+                //      a clear error in the tray so the user knows to act.
+                if (!_pptService.IsConnected)
+                {
+                    _consecutiveComFailures++;
+
+                    if (_consecutiveComFailures == 1 || _consecutiveComFailures % 5 == 0)
+                    {
+                        Log.Warning("PowerPoint COM went stale (failure #{N}). Attempting TryReattach...",
+                            _consecutiveComFailures);
+                        StatusChanged?.Invoke(_consecutiveComFailures == 1
+                            ? "PPT connection lost — reconnecting..."
+                            : $"PPT reconnect attempt #{_consecutiveComFailures / 5 + 1}...");
+
+                        bool reattached = _pptService.TryReattach();
+                        if (reattached)
+                        {
+                            Log.Information("PowerPoint COM reconnected after {N} failure(s)", _consecutiveComFailures);
+                            StatusChanged?.Invoke("PPT reconnected — resuming");
+                            _consecutiveComFailures = 0;
+                            _lastSlideIndex = -1;   // force slide reload on reconnect
+                            _lastPptPath = null;     // force PPT-path re-detection
+                            continue;
+                        }
+                    }
+
+                    if (_consecutiveComFailures >= 20)
+                    {
+                        Log.Error(
+                            "PowerPoint COM failed {N} consecutive times. Auto-stopping engine. " +
+                            "Please Stop and restart the engine with PowerPoint open.",
+                            _consecutiveComFailures);
+                        StatusChanged?.Invoke(
+                            "ERROR: PowerPoint connection lost — engine stopped. " +
+                            "Please use Stop Engine → Start Engine with PPT open.");
+                        break;  // exit the processing loop — engine is effectively dead
+                    }
+
+                    // Exponential backoff: 500ms × failures, capped at 5 seconds.
+                    // This prevents the 20-errors/second hammering that filled the log.
+                    int backoffMs = Math.Min(5000, _consecutiveComFailures * 500);
+                    Log.Warning("COM stale (failure #{N}) — backing off {Backoff}ms before next attempt",
+                        _consecutiveComFailures, backoffMs);
+
+                    try { await Task.Delay(backoffMs, ct); }
+                    catch (OperationCanceledException) { break; }
+                    continue;
+                }
+
+                // COM is healthy — reset the stale-COM failure counter
+                _consecutiveComFailures = 0;
+
                 if (currentSlideIndex > 0 && currentSlideIndex != _lastSlideIndex)
                 {
                     Log.Information("Slide changed from {Old} to {New}", _lastSlideIndex, currentSlideIndex);

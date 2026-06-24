@@ -1,11 +1,15 @@
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using PptPoc.Core.Configuration;
 using PptPoc.Core.Interfaces;
 using PptPoc.Core.Models;
 using Serilog;
+
+// Allow the Vision test project to reach internal members (test constructor + FakeHttpMessageHandler)
+[assembly: InternalsVisibleTo("PptPoc.Vision.Tests")]
 
 namespace PptPoc.Vision;
 
@@ -16,17 +20,34 @@ public class OpenAIVisionService : IOpenAIVisionService
     private readonly AppConfig _config;
     private readonly bool _isAnthropic;
 
-    public OpenAIVisionService(AppConfig config)
+    // ── Constructors ──────────────────────────────────────────────────────────
+
+    /// <summary>Production constructor — builds the default HttpClient with corporate SSL bypass.</summary>
+    public OpenAIVisionService(AppConfig config) : this(config, CreateDefaultHttpClient()) { }
+
+    /// <summary>
+    /// Test-only constructor — accepts an externally provided <see cref="HttpClient"/>
+    /// so unit tests can inject a <c>FakeHttpMessageHandler</c> without hitting a
+    /// real network endpoint. Mark internal so it is invisible to production callers.
+    /// </summary>
+    internal OpenAIVisionService(AppConfig config, HttpClient httpClient)
     {
         _config = config;
         _isAnthropic = string.Equals(config.VisionProvider, "anthropic", StringComparison.OrdinalIgnoreCase);
-
-        // Accept corporate/proxy SSL certificates and bypass DMZ proxy for internal endpoints
-        var handler = new HttpClientHandler();
-        handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-        handler.UseProxy = false;
-        _client = new HttpClient(handler);
+        _client = httpClient;
     }
+
+    private static HttpClient CreateDefaultHttpClient()
+    {
+        var handler = new HttpClientHandler();
+        // Accept corporate/proxy SSL certificates and bypass DMZ proxy for internal endpoints
+        handler.ServerCertificateCustomValidationCallback =
+            HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+        handler.UseProxy = false;
+        return new HttpClient(handler);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private object BuildImageContent(string base64Image) => _isAnthropic
         ? new { type = "image", source = new { type = "base64", media_type = "image/png", data = base64Image } }
@@ -87,6 +108,99 @@ public class OpenAIVisionService : IOpenAIVisionService
         + "and a 'rich_description'. For text elements, extract the core semantic key takeaways and conceptual meaning. "
         + "For image or chart elements, describe conceptually what the chart/image shows and its insights. "
         + "This will be used for conceptual semantic similarity matching.";
+
+    // ── API Preflight Ping ────────────────────────────────────────────────────
+    // Sends a minimal 1-token text-only request to verify that the configured
+    // endpoint is reachable and the GNAI_TOKEN is valid BEFORE any slide
+    // preprocessing begins. This surfaces auth and connectivity problems immediately
+    // with a clear user-facing error, rather than letting PreprocessAsync silently
+    // degrade the KB (all slides fail → zero matching for the entire session).
+    //
+    // Design choices:
+    //   • Text-only, max_tokens=1   → near-zero API cost, fastest possible response
+    //   • 10-second timeout          → enough for a cold proxy warm-up; fast enough
+    //                                  to not feel hung to the user
+    //   • Catches HttpRequestException (network), TaskCanceledException (timeout),
+    //     and logs the HTTP status + body on auth failure (401/403/502 etc.)
+    public async Task<bool> PingAsync()
+    {
+        var token = Environment.GetEnvironmentVariable("GNAI_TOKEN") ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            Log.Warning("PingAsync: GNAI_TOKEN environment variable is not set — aborting preflight.");
+            return false;
+        }
+
+        // Build the endpoint URL (same logic as PostForMessageContentAsync)
+        string endpoint;
+        if (_isAnthropic)
+        {
+            endpoint = $"{_config.OpenAIBaseUrl.TrimEnd('/')}/messages";
+            endpoint = endpoint.Replace("/providers/openai/", "/providers/anthropic/");
+        }
+        else
+        {
+            endpoint = $"{_config.OpenAIBaseUrl.TrimEnd('/')}/chat/completions";
+        }
+
+        // Minimal payload — text only, 1 token, no image, no JSON format required
+        object payload = _isAnthropic
+            ? (object)new
+            {
+                model = _config.OpenAIModel,
+                max_tokens = 1,
+                messages = new[] { new { role = "user", content = "hi" } }
+            }
+            : new
+            {
+                model = _config.OpenAIModel,
+                max_tokens = 1,
+                messages = new[] { new { role = "user", content = "hi" } }
+            };
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+            var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            if (_isAnthropic)
+                request.Headers.Add("anthropic-version", "2023-06-01");
+            request.Content = new StringContent(
+                JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+            var response = await _client.SendAsync(request, cts.Token);
+
+            if (response.IsSuccessStatusCode)
+            {
+                Log.Information("API preflight ping succeeded — endpoint reachable, token valid. ({StatusCode})",
+                    (int)response.StatusCode);
+                return true;
+            }
+
+            // Non-2xx: auth failure, quota, bad gateway, etc.
+            var body = await response.Content.ReadAsStringAsync();
+            Log.Error("API preflight ping failed: HTTP {StatusCode} — {Body}",
+                (int)response.StatusCode, body.Length > 300 ? body[..300] + "…" : body);
+            return false;
+        }
+        catch (TaskCanceledException)
+        {
+            Log.Error("API preflight ping timed out after 10 seconds — " +
+                      "endpoint unreachable or network/proxy issue. Endpoint: {Endpoint}", endpoint);
+            return false;
+        }
+        catch (HttpRequestException ex)
+        {
+            Log.Error(ex, "API preflight ping: network/DNS error — endpoint unreachable. Endpoint: {Endpoint}", endpoint);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "API preflight ping: unexpected error.");
+            return false;
+        }
+    }
 
     public async Task<string> AnalyzeSlideAsync(byte[] imageBytes, string manifest)
     {
@@ -340,5 +454,4 @@ public class OpenAIVisionService : IOpenAIVisionService
             return null;
         }
     }
-
 }

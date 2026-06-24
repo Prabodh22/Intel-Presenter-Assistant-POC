@@ -5,6 +5,17 @@ namespace PptPoc.Core.Interfaces;
 public interface IPowerPointService : IDisposable
 {
     bool TryAttach();
+
+    /// <summary>
+    /// Releases the current (potentially stale) COM reference and re-attaches
+    /// to whichever PowerPoint instance is currently running in the ROT.
+    /// Call this when IsConnected is true but COM calls are throwing
+    /// InvalidCastException — which signals the RCW has gone stale because
+    /// PowerPoint was closed and reopened or replaced by another instance.
+    /// Returns true if a valid connection is re-established.
+    /// </summary>
+    bool TryReattach();
+
     bool IsConnected { get; }
     int GetActiveSlideIndex();
     /// <summary>Returns the slide index from an already-obtained COM object, avoiding a second round-trip.</summary>
