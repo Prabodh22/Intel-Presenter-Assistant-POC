@@ -32,6 +32,12 @@ public class SlideReader : ISlideReader
         "val", "var", "ref", "col", "row", "num", "pct"
     };
 
+    private static readonly Regex NumericOcrTokenRegex =
+        new(@"^\d+(?:\.\d+)?%?$", RegexOptions.Compiled);
+
+    private static readonly Regex TerminalNoiseRegex =
+        new(@"(--|/|\\|::|=>|\$|\.py|\.sh|\.exe|\.cache)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     public SlideReader(IOcrService? ocr = null, IOpenAIVisionService? gptVision = null)
     {
         _ocr = ocr;
@@ -180,7 +186,9 @@ public class SlideReader : ISlideReader
                 if (_ocrCache.TryGetValue(shapeId, out var cachedWords))
                 {
                     img.ExtractedWords = cachedWords;
-                    var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
+                    img.SearchableWords = FilterSearchableOcrWords(cachedWords);
+                    img.FilteredOcrText = string.Join(" ", img.SearchableWords.Select(w => w.Text));
+                    var combinedText = img.FilteredOcrText;
                     foreach (var word in FilteredTokenize(NormalizeText(combinedText)))
                     {
                         if (!img.InferredKeywords.Contains(word))
@@ -424,7 +432,9 @@ public class SlideReader : ISlideReader
                 if (_ocrCache.TryGetValue(shapeId, out var cachedWords))
                 {
                     img.ExtractedWords = cachedWords;
-                    var combinedText = string.Join(" ", cachedWords.Select(w => w.Text));
+                    img.SearchableWords = FilterSearchableOcrWords(cachedWords);
+                    img.FilteredOcrText = string.Join(" ", img.SearchableWords.Select(w => w.Text));
+                    var combinedText = img.FilteredOcrText;
                     foreach (var word in FilteredTokenize(NormalizeText(combinedText)))
                     {
                         if (!img.InferredKeywords.Contains(word))
@@ -469,8 +479,10 @@ public class SlideReader : ISlideReader
             {
                 _ocrCache[shapeId] = ocrWords;
                 img.ExtractedWords = ocrWords;
+                img.SearchableWords = FilterSearchableOcrWords(ocrWords);
+                img.FilteredOcrText = string.Join(" ", img.SearchableWords.Select(w => w.Text));
 
-                var combinedText = string.Join(" ", ocrWords.Select(w => w.Text));
+                var combinedText = img.FilteredOcrText;
                 // ── Enhancement #7: Filter noise words from InferredKeywords ─
                 var tokenized = FilteredTokenize(NormalizeText(combinedText));
                 foreach (var word in tokenized)
@@ -488,6 +500,11 @@ public class SlideReader : ISlideReader
                 var explanation = await _gptVision.ExplainImageAsync(imageBytes, ocrWords);
                 if (!string.IsNullOrWhiteSpace(explanation))
                     img.GptDescription = explanation;
+            }
+
+            if (!string.IsNullOrWhiteSpace(img.GptDescription) || !string.IsNullOrWhiteSpace(img.FilteredOcrText))
+            {
+                img.VisualSearchText = $"{img.GptDescription} {img.FilteredOcrText}".Trim();
             }
 
             WriteImageDebugArtifact(slideIndex, img);
@@ -520,6 +537,53 @@ public class SlideReader : ISlideReader
             if (Regex.IsMatch(word, @"^\d+$") && word.Length <= 4) continue;
 
             filtered.Add(word);
+        }
+
+        return filtered;
+    }
+
+    private static List<OcrWordInfo> FilterSearchableOcrWords(IReadOnlyList<OcrWordInfo> words)
+    {
+        var filtered = new List<OcrWordInfo>();
+
+        foreach (var word in words)
+        {
+            if (word == null || string.IsNullOrWhiteSpace(word.Text))
+                continue;
+
+            var raw = word.Text.Trim();
+            if (TerminalNoiseRegex.IsMatch(raw))
+                continue;
+
+            var normalized = NormalizeText(raw);
+            if (string.IsNullOrWhiteSpace(normalized))
+                continue;
+
+            var token = normalized
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(token))
+                continue;
+
+            bool isNumericToken = NumericOcrTokenRegex.IsMatch(token);
+
+            if (token.Length < 3 && !isNumericToken)
+                continue;
+
+            if (OcrNoiseWords.Contains(token))
+                continue;
+
+            if (Regex.IsMatch(token, @"^\d+$") && token.Length <= 4)
+                continue;
+
+            filtered.Add(new OcrWordInfo
+            {
+                Text = token,
+                X = word.X,
+                Y = word.Y,
+                Width = word.Width,
+                Height = word.Height
+            });
         }
 
         return filtered;
@@ -593,6 +657,33 @@ public class SlideReader : ISlideReader
                 return;
             }
 
+            string? smartArtVisualId = null;
+            if (IsSmartArtShape(shape))
+            {
+                var smartArtVisual = new ImageElement
+                {
+                    ElementId = $"{idPrefix}I{shape.Id}_{snapshot.SlideIndex}",
+                    ShapeName = shape.Name,
+                    Left = shape.Left,
+                    Top = shape.Top,
+                    Width = shape.Width,
+                    Height = shape.Height,
+                    BoundingBox255 = CalcBox255(shape.Left, shape.Top, shape.Width, shape.Height, sW, sH),
+                    ZOrder = shape.ZOrderPosition,
+                    AltText = GetAltText(shape),
+                    Title = GetTitle(shape),
+                    NearbyText = FindNearbyText(shape, snapshot),
+                    InferredKeywords = InferKeywords(GetAltText(shape), GetTitle(shape), FindNearbyText(shape, snapshot)),
+                    VisualType = "diagram",
+                    VisualSubtype = "smartart",
+                    Importance = "high"
+                };
+
+                ClassifyVisualImportance(smartArtVisual, sW, sH);
+                snapshot.ImageElements.Add(smartArtVisual);
+                smartArtVisualId = smartArtVisual.ElementId;
+            }
+
             // Extract text elements — one per paragraph for sentence-level highlighting.
             if (shape.HasTextFrame == Office.MsoTriState.msoTrue)
             {
@@ -638,7 +729,9 @@ public class SlideReader : ISlideReader
                         RawText        = text,
                         NormalizedText = normalized,
                         Words          = TokenizeWords(normalized),
-                        ParagraphIndex = pi
+                        ParagraphIndex = pi,
+                        ParentVisualId = smartArtVisualId,
+                        ParentVisualReason = smartArtVisualId != null ? "smartart_text_routes_to_diagram" : null
                     });
                 }
             }
@@ -703,10 +796,11 @@ public class SlideReader : ISlideReader
                 var nearbyText = FindNearbyText(shape, snapshot);
                 var keywords = InferKeywords(altText, title, nearbyText);
                 var numericFacts = new List<string>();
+                var chartVisualId = $"{idPrefix}C{shape.Id}_{snapshot.SlideIndex}";
 
-                snapshot.ImageElements.Add(new ImageElement
+                var chartVisual = new ImageElement
                 {
-                    ElementId = $"{idPrefix}C{shape.Id}_{snapshot.SlideIndex}",
+                    ElementId = chartVisualId,
                     ShapeName = shape.Name,
                     Left = shape.Left,
                     Top = shape.Top,
@@ -718,8 +812,12 @@ public class SlideReader : ISlideReader
                     Title = title,
                     NearbyText = nearbyText,
                     InferredKeywords = keywords,
-                    ChartNumericFacts = numericFacts
-                });
+                    ChartNumericFacts = numericFacts,
+                    VisualType = "chart",
+                    Importance = "high"
+                };
+                ClassifyVisualImportance(chartVisual, sW, sH);
+                snapshot.ImageElements.Add(chartVisual);
 
                 // Extract chart text data (categories, series names, chart title) as TextElements
                 try
@@ -815,7 +913,9 @@ public class SlideReader : ISlideReader
                             RawText        = ct,
                             NormalizedText = normalized,
                             Words          = TokenizeWords(normalized),
-                            ParagraphIndex = 0
+                            ParagraphIndex = 0,
+                            ParentVisualId = chartVisualId,
+                            ParentVisualReason = "chart_label_routes_to_chart_bbox"
                         });
                     }
 
@@ -838,7 +938,7 @@ public class SlideReader : ISlideReader
                 var nearbyText = FindNearbyText(shape, snapshot);
                 var keywords = InferKeywords(altText, title, nearbyText);
 
-                snapshot.ImageElements.Add(new ImageElement
+                var imageVisual = new ImageElement
                 {
                     ElementId = $"{idPrefix}I{shape.Id}_{snapshot.SlideIndex}",
                     ShapeName = shape.Name,
@@ -852,12 +952,53 @@ public class SlideReader : ISlideReader
                     Title = title,
                     NearbyText = nearbyText,
                     InferredKeywords = keywords
-                });
+                };
+
+                ClassifyVisualImportance(imageVisual, sW, sH);
+                snapshot.ImageElements.Add(imageVisual);
             }
         }
         catch (COMException ex)
         {
             Log.Warning(ex, "Error processing shape {ShapeName}", shape.Name);
+        }
+    }
+
+    private static bool IsSmartArtShape(Ppt.Shape shape)
+    {
+        try
+        {
+            return shape.HasSmartArt == Office.MsoTriState.msoTrue;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ClassifyVisualImportance(ImageElement image, float slideWidth, float slideHeight)
+    {
+        var combinedMeta = NormalizeText($"{image.ShapeName} {image.Title} {image.AltText}");
+        bool logoLike = combinedMeta.Contains("logo") || combinedMeta.Contains("watermark") || combinedMeta.Contains("brand icon");
+        double slideArea = Math.Max(1.0, slideWidth * slideHeight);
+        double areaRatio = (image.Width * image.Height) / slideArea;
+
+        if (string.IsNullOrWhiteSpace(image.VisualType))
+            image.VisualType = "image";
+
+        if (logoLike)
+        {
+            image.VisualType = "logo";
+            image.IsDecorative = true;
+            image.Importance = "low";
+            return;
+        }
+
+        if (areaRatio < 0.015 && string.IsNullOrWhiteSpace(image.GptDescription) && image.InferredKeywords.Count <= 2)
+        {
+            image.IsDecorative = true;
+            image.Importance = "low";
+            image.VisualSubtype ??= "small_decorative";
         }
     }
 

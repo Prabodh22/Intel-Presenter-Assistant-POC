@@ -20,18 +20,64 @@ public class TextElement : SlideElement
     public string NormalizedText { get; set; } = string.Empty;
     public List<string> Words { get; set; } = new();
     public int ParagraphIndex { get; set; }
+
+    /// <summary>
+    /// When this text element is a chart label, legend item, or other child shape,
+    /// this points to the parent image element that should receive the highlight.
+    /// </summary>
+    public string? ParentVisualId { get; set; }
+
+    /// <summary>
+    /// Human-readable reason for the parent-child routing decision.
+    /// </summary>
+    public string? ParentVisualReason { get; set; }
 }
 
 public class ImageElement : SlideElement
 {
     public List<OcrWordInfo> ExtractedWords { get; set; } = new();
+    public List<OcrWordInfo> SearchableWords { get; set; } = new();
     public string AltText { get; set; } = string.Empty;
     public string ProximityText { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
     public string NearbyText { get; set; } = string.Empty;
     public List<string> InferredKeywords { get; set; } = new();
+
     // Normalized numeric values extracted from chart objects (for example: 25, 12.5, 40%)
     public List<string> ChartNumericFacts { get; set; } = new();
+
+    /// <summary>Classified visual type such as chart, screenshot, diagram, table_image, logo, or unknown.</summary>
+    public string? VisualType { get; set; }
+
+    /// <summary>Optional subtype for richer routing and scoring.</summary>
+    public string? VisualSubtype { get; set; }
+
+    /// <summary>Rich search text built from description + filtered OCR.</summary>
+    public string? VisualSearchText { get; set; }
+
+    /// <summary>Clean OCR subset that should not be merged into the general slide text pool.</summary>
+    public string? FilteredOcrText { get; set; }
+
+    /// <summary>Location label such as top-left, right, bottom, or center.</summary>
+    public string? LocationLabel { get; set; }
+
+    /// <summary>Horizontal region for location-aware matching.</summary>
+    public string? RegionHorizontal { get; set; }
+
+    /// <summary>Vertical region for location-aware matching.</summary>
+    public string? RegionVertical { get; set; }
+
+    /// <summary>Importance hint for scoring: high, medium, or low.</summary>
+    public string? Importance { get; set; } = "medium";
+
+    /// <summary>True when the visual is decorative and should be deprioritized.</summary>
+    public bool IsDecorative { get; set; }
+
+    /// <summary>Embedding source provenance for downstream regeneration decisions.</summary>
+    public string? EmbeddingSource { get; set; }
+
+    /// <summary>Current embedding freshness status.</summary>
+    public string? EmbeddingStatus { get; set; }
 }
 
 public class SlideSnapshot

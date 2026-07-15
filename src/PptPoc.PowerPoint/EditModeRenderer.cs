@@ -34,7 +34,8 @@ public class EditModeRenderer : IHighlightRenderer
         try
         {
             // If already highlighted, just refresh timestamp instead of drawing a duplicate bounding box
-            if (_highlightShapeNames.TryGetValue(request.Element.ElementId, out string shapeName))
+            if (_highlightShapeNames.TryGetValue(request.Element.ElementId, out var shapeName) &&
+                !string.IsNullOrWhiteSpace(shapeName))
             {
                 try
                 {

@@ -12,7 +12,9 @@ using System.Windows.Forms;
 using Application = System.Windows.Application;
 using System.Threading.Tasks;
 using System.Drawing;
+using System.Drawing.Text;
 using PptPoc.Core.Interfaces;
+using System.IO;
 
 using Microsoft.Extensions.Configuration;
 using System.Threading;
@@ -49,48 +51,160 @@ public partial class App : Application
 
     protected override async void OnStartup(StartupEventArgs e)
     {
-        _mutex = new Mutex(true, "PptPocEngine_Unique_Mutex", out bool createdNew);
-        if (!createdNew)
+        try
         {
-            System.Windows.MessageBox.Show("The Engine is already running in your System Tray!", "Already Running", MessageBoxButton.OK, MessageBoxImage.Information);
+            SetupGlobalExceptionHandlers();
+
+            _mutex = new Mutex(true, "PptPocEngine_Unique_Mutex", out bool createdNew);
+            if (!createdNew)
+            {
+                System.Windows.MessageBox.Show("The Engine is already running in your System Tray!", "Already Running", MessageBoxButton.OK, MessageBoxImage.Information);
+                Current.Shutdown();
+                return;
+            }
+
+            base.OnStartup(e);
+
+            if (!ValidateRuntimePackagingPreconditions())
+            {
+                Current.Shutdown();
+                return;
+            }
+
+            // Inject Proxy globally for the current process
+            Environment.SetEnvironmentVariable("HTTP_PROXY", "http://proxy-iind.intel.com:911", EnvironmentVariableTarget.Process);
+            Environment.SetEnvironmentVariable("HTTPS_PROXY", "http://proxy-iind.intel.com:911", EnvironmentVariableTarget.Process);
+
+            var config = AppConfigLoader.Load();
+
+            ConfigureLogging(config);
+
+            Log.Information("System Tray POC starting from {BaseDirectory}", AppContext.BaseDirectory);
+
+            InitializeNotifyIcon();
+            
+            // Ensure GNAI Token exists or prompt now.
+            EnsureTokenExists();
+
+            var splash = new SplashWindow();
+            splash.Show();
+
+            _statusIndicator = new StatusIndicatorWindow(config.LaserToggleHotkey);
+            _statusIndicator.Show();
+            _statusIndicator.UpdateStatus("Paused");
+
+            await InitializeEngineAndStart(config, splash);
+            
+            splash.Close();
+            
+            // Wait for the UI layout to settle after the splash window closes
+            await Task.Delay(500);
+            _notifyIcon?.ShowBalloonTip(3000, "PPT Helper", "Running silently in background. Right-click the tray icon for options.", ToolTipIcon.Info);
+        }
+        catch (Exception ex)
+        {
+            TryLogFatal(ex, "Startup failed before engine initialization completed.");
+            System.Windows.MessageBox.Show(
+                "Application failed during startup.\n\n" + ex.Message,
+                "Startup Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
             Current.Shutdown();
+        }
+    }
+
+    private static void ConfigureLogging(AppConfig config)
+    {
+        var primaryLogPath = ResolveLogFilePath(config.LogFilePath);
+
+        try
+        {
+            var primaryDir = Path.GetDirectoryName(primaryLogPath);
+            if (!string.IsNullOrWhiteSpace(primaryDir))
+                Directory.CreateDirectory(primaryDir);
+
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Debug()
+                .WriteTo.File(primaryLogPath, rollingInterval: RollingInterval.Day)
+                .CreateLogger();
             return;
         }
+        catch
+        {
+            // Fall through to local app data fallback.
+        }
 
-        base.OnStartup(e);
-
-        // Inject Proxy globally for the current process
-        Environment.SetEnvironmentVariable("HTTP_PROXY", "http://proxy-iind.intel.com:911", EnvironmentVariableTarget.Process);
-        Environment.SetEnvironmentVariable("HTTPS_PROXY", "http://proxy-iind.intel.com:911", EnvironmentVariableTarget.Process);
-
-        var config = AppConfigLoader.Load();
+        var fallbackDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PptPoc",
+            "logs");
+        Directory.CreateDirectory(fallbackDir);
+        var fallbackLogPath = Path.Combine(fallbackDir, "pptpoc-.log");
 
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Debug()
-            .WriteTo.File(config.LogFilePath, rollingInterval: RollingInterval.Day)
+            .WriteTo.File(fallbackLogPath, rollingInterval: RollingInterval.Day)
             .CreateLogger();
+    }
 
-        Log.Information("System Tray POC starting");
+    private static string ResolveLogFilePath(string configuredPath)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return Path.Combine(AppContext.BaseDirectory, "logs", "pptpoc-.log");
 
-        InitializeNotifyIcon();
-        
-        // Ensure GNAI Token exists or prompt now.
-        EnsureTokenExists();
+        return Path.IsPathRooted(configuredPath)
+            ? configuredPath
+            : Path.Combine(AppContext.BaseDirectory, configuredPath);
+    }
 
-        var splash = new SplashWindow();
-        splash.Show();
+    private static bool ValidateRuntimePackagingPreconditions()
+    {
+        try
+        {
+            var probeFile = Path.Combine(Path.GetTempPath(), $"pptpoc_probe_{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(probeFile, "ok");
+            File.Delete(probeFile);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(
+                "Failed to access the TEMP directory required by the packaged app.\n\n" +
+                "Please ensure TEMP/TMP is writable and try again.\n\n" +
+                ex.Message,
+                "Packaging Runtime Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            return false;
+        }
+    }
 
-        _statusIndicator = new StatusIndicatorWindow(config.LaserToggleHotkey);
-        _statusIndicator.Show();
-        _statusIndicator.UpdateStatus("Paused");
+    private static void SetupGlobalExceptionHandlers()
+    {
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            if (args.ExceptionObject is Exception ex)
+                TryLogFatal(ex, "Unhandled AppDomain exception.");
+        };
 
-        await InitializeEngineAndStart(config, splash);
-        
-        splash.Close();
-        
-        // Wait for the UI layout to settle after the splash window closes
-        await Task.Delay(500);
-        _notifyIcon?.ShowBalloonTip(3000, "PPT Helper", "Running silently in background. Right-click the tray icon for options.", ToolTipIcon.Info);
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            TryLogFatal(args.Exception, "Unobserved task exception.");
+            args.SetObserved();
+        };
+    }
+
+    private static void TryLogFatal(Exception ex, string message)
+    {
+        try
+        {
+            Log.Fatal(ex, message);
+            Log.CloseAndFlush();
+        }
+        catch
+        {
+            // Last-resort path: avoid crashing inside exception logging.
+        }
     }
 
     private void EnsureTokenExists()
@@ -98,13 +212,65 @@ public partial class App : Application
         var token = Environment.GetEnvironmentVariable("GNAI_TOKEN") ?? Environment.GetEnvironmentVariable("GNAI_TOKEN", EnvironmentVariableTarget.User);
         if (string.IsNullOrWhiteSpace(token))
         {
-            var dialog = new TokenInputDialog();
-            dialog.ShowDialog();
+            PromptForToken("Set GNAI API Key");
         }
         else
         {
             Environment.SetEnvironmentVariable("GNAI_TOKEN", token, EnvironmentVariableTarget.Process);
         }
+    }
+
+    private bool PromptForToken(string title)
+    {
+        var dialog = new TokenInputDialog();
+        dialog.Title = title;
+
+        var owner = Current?.MainWindow;
+        if (CanAssignDialogOwner(owner, dialog))
+        {
+            dialog.Owner = owner!;
+        }
+
+        dialog.ShowDialog();
+
+        if (dialog.DialogResult == true && !string.IsNullOrWhiteSpace(dialog.ApiKey))
+        {
+            ApplyToken(dialog.ApiKey);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool CanAssignDialogOwner(Window? owner, Window dialog)
+    {
+        return owner != null && !ReferenceEquals(owner, dialog);
+    }
+
+    private async Task<bool> PromptForTokenAndRetryAsync(Func<Task<bool>> pingCheck, string title)
+    {
+        if (!PromptForToken(title))
+            return false;
+
+        return await pingCheck();
+    }
+
+    private static void ApplyToken(string token)
+    {
+        Environment.SetEnvironmentVariable("GNAI_TOKEN", token, EnvironmentVariableTarget.Process);
+        try
+        {
+            Environment.SetEnvironmentVariable("GNAI_TOKEN", token, EnvironmentVariableTarget.User);
+        }
+        catch
+        {
+            // Ignore permission issues when writing the user environment store.
+        }
+    }
+
+    private static void ClearProcessToken()
+    {
+        Environment.SetEnvironmentVariable("GNAI_TOKEN", null, EnvironmentVariableTarget.Process);
     }
 
     private void InitializeNotifyIcon()
@@ -118,15 +284,15 @@ public partial class App : Application
         
         var contextMenu = new ContextMenuStrip();
         
-        contextMenu.Items.Add("Update GNAI Token", null, (s, e) => 
+        var updateTokenItem = CreateMenuItem("Update GNAI Token", (s, e) =>
         {
-            var dialog = new TokenInputDialog();
-            dialog.ShowDialog();
+            PromptForToken("Update GNAI API Key");
         });
+        contextMenu.Items.Add(updateTokenItem);
 
         contextMenu.Items.Add(new ToolStripSeparator());
         
-        _startMenuItem = new ToolStripMenuItem("Start Engine", null, async (s, e) => 
+        _startMenuItem = CreateMenuItem("Start Engine", async (s, e) => 
         { 
             try 
             {
@@ -146,24 +312,31 @@ public partial class App : Application
                     if (!apiOk)
                     {
                         var currentToken = Environment.GetEnvironmentVariable("GNAI_TOKEN") ?? string.Empty;
+                        ClearProcessToken();
+                        Log.Warning("API preflight failed. Cleared process token before prompting for a replacement.");
+
                         string detail = string.IsNullOrWhiteSpace(currentToken)
-                            ? "GNAI_TOKEN is not set.\n\nUse 'Update GNAI Token' in the tray menu to enter your token."
-                            : "The API endpoint is unreachable or returned an auth/server error.\n\n" +
-                              "• Check that you are on the Intel network or VPN\n" +
-                              "• Verify your GNAI_TOKEN is correct (use 'Update GNAI Token')\n" +
-                              "• Check the log file for the exact HTTP status code";
+                            ? "GNAI_TOKEN is not set.\n\nEnter a new key when prompted."
+                            : "The stored token appears invalid or expired.\n\nEnter a new key when prompted.";
 
-                        Log.Error("API preflight ping failed — aborting engine start.");
-                        System.Windows.MessageBox.Show(
-                            $"API connectivity check failed — engine not started.\n\n{detail}",
-                            "API Not Reachable",
-                            MessageBoxButton.OK,
-                            MessageBoxImage.Warning);
+                        if (await PromptForTokenAndRetryAsync(() => _visionService.PingAsync(), "Update GNAI API Key"))
+                        {
+                            apiOk = true;
+                        }
+                        else
+                        {
+                            Log.Error("API preflight ping failed — aborting engine start.");
+                            System.Windows.MessageBox.Show(
+                                $"API connectivity check failed — engine not started.\n\n{detail}",
+                                "API Not Reachable",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Warning);
 
-                        UpdateMenuState(false);
-                        _statusIndicator?.UpdateStatus("Paused");
-                        _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
-                        return;
+                            UpdateMenuState(false);
+                            _statusIndicator?.UpdateStatus("Paused");
+                            _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
+                            return;
+                        }
                     }
 
                     Log.Information("API preflight ping passed — proceeding to knowledge base build.");
@@ -203,7 +376,7 @@ public partial class App : Application
             }
         });
         
-        _stopMenuItem = new ToolStripMenuItem("Stop Engine", null, async (s, e) => 
+        _stopMenuItem = CreateMenuItem("Stop Engine", async (s, e) => 
         { 
             if (_orchestrator != null) 
             {
@@ -224,7 +397,7 @@ public partial class App : Application
         // If the engine is currently running, it is stopped first, the KB is
         // rebuilt, and then the engine is automatically restarted — so the user
         // gets a seamless "refresh and keep going" experience.
-        _refreshMenuItem = new ToolStripMenuItem("Refresh Knowledge Base", null, async (s, e) =>
+        _refreshMenuItem = CreateMenuItem("Refresh Knowledge Base", async (s, e) =>
         {
             try
             {
@@ -274,16 +447,24 @@ public partial class App : Application
                 bool apiOk = await _visionService.PingAsync();
                 if (!apiOk)
                 {
-                    Log.Error("Refresh KB: API preflight ping failed.");
-                    System.Windows.MessageBox.Show(
-                        "API connectivity check failed — knowledge base not rebuilt.\n\n" +
-                        "Check that you are on the Intel network or VPN and that your GNAI_TOKEN is valid.",
-                        "API Not Reachable",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Warning);
-                    _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
-                    _statusIndicator?.UpdateStatus("Paused");
-                    return;
+                    ClearProcessToken();
+                    Log.Warning("Refresh KB preflight failed. Cleared process token before prompting for a replacement.");
+
+                    if (!await PromptForTokenAndRetryAsync(() => _visionService.PingAsync(), "Update GNAI API Key"))
+                    {
+                        Log.Error("Refresh KB: API preflight ping failed.");
+                        System.Windows.MessageBox.Show(
+                            "API connectivity check failed — knowledge base not rebuilt.\n\n" +
+                            "Check that you are on the Intel network or VPN and that your GNAI_TOKEN is valid.",
+                            "API Not Reachable",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+                        _notifyIcon.Text = "PPT Highlighting Engine (Stopped)";
+                        _statusIndicator?.UpdateStatus("Paused");
+                        return;
+                    }
+
+                    apiOk = true;
                 }
 
                 // ── Step 5: Rebuild KB ─────────────────────────────────────────
@@ -335,7 +516,7 @@ public partial class App : Application
         contextMenu.Items.Add(_refreshMenuItem);
         
         contextMenu.Items.Add(new ToolStripSeparator());
-        contextMenu.Items.Add("Exit", null, (s, e) => 
+        contextMenu.Items.Add(CreateMenuItem("Exit", (s, e) => 
         {
             Task.Run(async () => 
             {
@@ -349,7 +530,7 @@ public partial class App : Application
                     Current.Shutdown();
                 });
             });
-        });
+        }));
 
         _notifyIcon.ContextMenuStrip = contextMenu;
     }
@@ -366,17 +547,43 @@ public partial class App : Application
             : "PPT Highlighting Engine (Stopped)";
     }
 
+    private static ToolStripMenuItem CreateMenuItem(string text, EventHandler handler)
+    {
+        var item = new ToolStripMenuItem(text, null, handler);
+        item.DisplayStyle = ToolStripItemDisplayStyle.Text;
+        item.TextImageRelation = TextImageRelation.Overlay;
+        return item;
+    }
+
+    private static ToolStripMenuItem CreateMenuItem(string text, Func<object?, EventArgs, Task> handler)
+    {
+        var item = new ToolStripMenuItem(text);
+        item.DisplayStyle = ToolStripItemDisplayStyle.Text;
+        item.TextImageRelation = TextImageRelation.Overlay;
+        item.Click += async (s, e) => await handler(s, e);
+        return item;
+    }
+
     private Icon CreatePocIcon()
     {
         var bitmap = new Bitmap(16, 16);
+        bitmap.MakeTransparent(Color.Black);
+
         using (var graphics = Graphics.FromImage(bitmap))
-        using (var font = new Font("Arial", 7, System.Drawing.FontStyle.Bold))
-        using (var brush = new SolidBrush(Color.White))
-        using (var bgBrush = new SolidBrush(Color.DarkBlue))
         {
-            graphics.FillRectangle(bgBrush, 0, 0, 16, 16);
-            graphics.DrawString("POC", font, brush, -2, 2);
+            graphics.Clear(Color.Transparent);
+            graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+            using var bgBrush = new SolidBrush(Color.FromArgb(0, 90, 180));
+            using var borderPen = new Pen(Color.White);
+            using var font = new System.Drawing.Font("Segoe UI", 7, System.Drawing.FontStyle.Bold);
+            using var brush = new SolidBrush(Color.White);
+
+            graphics.FillRectangle(bgBrush, 1, 1, 14, 14);
+            graphics.DrawRectangle(borderPen, 1, 1, 14, 14);
+            graphics.DrawString("P", font, brush, 3, 1);
         }
+
         return Icon.FromHandle(bitmap.GetHicon());
     }
 

@@ -148,19 +148,8 @@ public class Orchestrator : IOrchestrator
         ISemanticEmbeddingService? semanticService = null)
     {
         _config = config;
-        
-        // Phase 2 Latency Optimization — tuned from log analysis (pptpoc-20260617.log)
-        _config.OrchestratorLoopMs = 50; 
-        _config.AsrMinStepMs = 150;
 
-        _config.TranscriptWindowSeconds = 3;
-        
-        _config.HighlightDurationMs = 1500;
-        _config.CooldownMs = 400;
-        _config.GlobalCooldownMs = 150;
-        _config.StabilityRequiredCycles = 1;
-
-        _config.MatchConfidenceThreshold = 0.35;
+        ApplyRealtimeSafetyBounds();
         
         _pptService = pptService;
         _slideReader = slideReader;
@@ -173,6 +162,52 @@ public class Orchestrator : IOrchestrator
         _kbLoader = kbLoader;
         _ragAgent = ragAgent;
         _semanticService = semanticService;
+    }
+
+    /// <summary>
+    /// Keeps runtime knobs inside a stable operating range so demo-time
+    /// low-latency tweaks do not degrade ASR into dropped/garbled transcripts.
+    /// </summary>
+    private void ApplyRealtimeSafetyBounds()
+    {
+        int originalChunk = _config.AudioChunkMs;
+        int originalWindow = _config.AsrTranscriptionWindowSeconds;
+        int originalStep = _config.AsrMinStepMs;
+        int originalLoop = _config.OrchestratorLoopMs;
+
+        // Below ~180ms chunks and sub-2s windows tend to hurt non-streaming Parakeet stability.
+        _config.AudioChunkMs = Math.Clamp(_config.AudioChunkMs, 180, 500);
+        _config.AsrTranscriptionWindowSeconds = Math.Clamp(_config.AsrTranscriptionWindowSeconds, 2, 8);
+        _config.AsrMinStepMs = Math.Clamp(_config.AsrMinStepMs, 150, 800);
+        _config.OrchestratorLoopMs = Math.Clamp(_config.OrchestratorLoopMs, 40, 250);
+
+        if (_config.AsrBufferSeconds < _config.AsrTranscriptionWindowSeconds)
+        {
+            _config.AsrBufferSeconds = _config.AsrTranscriptionWindowSeconds;
+        }
+
+        if (originalChunk != _config.AudioChunkMs
+            || originalWindow != _config.AsrTranscriptionWindowSeconds
+            || originalStep != _config.AsrMinStepMs
+            || originalLoop != _config.OrchestratorLoopMs)
+        {
+            Log.Warning(
+                "Adjusted audio/ASR settings to stable bounds. " +
+                "AudioChunkMs: {ChunkOld}->{ChunkNew}, AsrWindowSec: {WinOld}->{WinNew}, " +
+                "AsrMinStepMs: {StepOld}->{StepNew}, LoopMs: {LoopOld}->{LoopNew}",
+                originalChunk, _config.AudioChunkMs,
+                originalWindow, _config.AsrTranscriptionWindowSeconds,
+                originalStep, _config.AsrMinStepMs,
+                originalLoop, _config.OrchestratorLoopMs);
+        }
+
+        // Matching-side defaults retained from prior tuning.
+        _config.TranscriptWindowSeconds = Math.Clamp(_config.TranscriptWindowSeconds, 3, 12);
+        _config.HighlightDurationMs = Math.Clamp(_config.HighlightDurationMs, 800, 3000);
+        _config.CooldownMs = Math.Clamp(_config.CooldownMs, 250, 2000);
+        _config.GlobalCooldownMs = Math.Clamp(_config.GlobalCooldownMs, 100, 1000);
+        _config.StabilityRequiredCycles = Math.Clamp(_config.StabilityRequiredCycles, 1, 4);
+        _config.MatchConfidenceThreshold = Math.Clamp(_config.MatchConfidenceThreshold, 0.2, 0.8);
     }
 
     public async Task StartAsync()
@@ -819,44 +854,65 @@ public class Orchestrator : IOrchestrator
                 if (matches.Count == 0)
                     continue;
 
-                // 7. Take top result only
-                var topMatch = matches[0];
+                // 7. Render top result and optionally one strong complementary modality result.
+                var selectedMatches = new List<MatchResult> { matches[0] };
+                var complementary = matches
+                    .Skip(1)
+                    .FirstOrDefault(m =>
+                        m.Type != matches[0].Type &&
+                        m.Confidence >= matches[0].Confidence - 0.08 &&
+                        !string.Equals(m.Element.ElementId, matches[0].Element.ElementId, StringComparison.OrdinalIgnoreCase));
 
-                // 8. Debounce check
-                if (!_debounce.ShouldHighlight(topMatch.Element.ElementId, topMatch.Confidence, topMatch.Type))
-                    continue;
+                if (complementary != null)
+                    selectedMatches.Add(complementary);
 
-                // 9. Render highlight
-                var highlightRequest = new HighlightRequest
+                bool anyHighlightApplied = false;
+                for (int idx = 0; idx < selectedMatches.Count; idx++)
                 {
-                    Element            = topMatch.Element,
-                    Confidence         = topMatch.Confidence,
-                    Type               = topMatch.Type,
-                    DurationMs         = _config.HighlightDurationMs,
-                    MatchedOcrWords    = topMatch.MatchedOcrWords,
-                    ParentImageElement = topMatch.ParentImageElement
-                };
+                    var match = selectedMatches[idx];
 
-                bool highlightApplied = await RunOnUiAsync(() =>
-                {
-                    var slideObj = _pptService.GetActiveSlideComObject();
-                    if (slideObj == null)
-                        return false;
+                    if (!_debounce.ShouldHighlight(match.Element.ElementId, match.Confidence, match.Type))
+                        continue;
 
-                    _renderer.Highlight(highlightRequest, slideObj);
-                    return true;
-                });
+                    var highlightRequest = new HighlightRequest
+                    {
+                        Element = match.Element,
+                        Confidence = match.Confidence,
+                        Type = match.Type,
+                        DurationMs = _config.HighlightDurationMs,
+                        MatchedOcrWords = match.MatchedOcrWords,
+                        ParentImageElement = match.ParentImageElement
+                    };
 
-                if (!highlightApplied)
+                    bool highlightApplied = await RunOnUiAsync(() =>
+                    {
+                        var slideObj = _pptService.GetActiveSlideComObject();
+                        if (slideObj == null)
+                            return false;
+
+                        _renderer.Highlight(highlightRequest, slideObj);
+                        return true;
+                    });
+
+                    if (!highlightApplied)
+                        continue;
+
+                    anyHighlightApplied = true;
+                    _debounce.RecordHighlight(match.Element.ElementId, match.Confidence, match.Type);
+
+                    HighlightApplied?.Invoke(
+                        $"{match.Type}: '{match.MatchedPhrase}' → {match.Element.ShapeName} ({match.Confidence:P0})");
+
+                    Log.Information("Highlight applied: {Type} on {ShapeName}, phrase='{Phrase}', confidence={Confidence:F2}",
+                        match.Type, match.Element.ShapeName, match.MatchedPhrase, match.Confidence);
+
+                    // Brief gap so two strong modalities can both be visible in one loop.
+                    if (idx == 0 && selectedMatches.Count > 1)
+                        await Task.Delay(120, ct);
+                }
+
+                if (!anyHighlightApplied)
                     continue;
-
-                _debounce.RecordHighlight(topMatch.Element.ElementId, topMatch.Confidence, topMatch.Type);
-
-                HighlightApplied?.Invoke(
-                    $"{topMatch.Type}: '{topMatch.MatchedPhrase}' → {topMatch.Element.ShapeName} ({topMatch.Confidence:P0})");
-
-                Log.Information("Highlight applied: {Type} on {ShapeName}, phrase='{Phrase}', confidence={Confidence:F2}",
-                    topMatch.Type, topMatch.Element.ShapeName, topMatch.MatchedPhrase, topMatch.Confidence);
             }
             catch (OperationCanceledException)
             {

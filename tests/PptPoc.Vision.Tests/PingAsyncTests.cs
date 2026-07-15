@@ -62,6 +62,42 @@ public class PingAsyncTests
     }
 
     [Fact]
+    public async Task PingAsync_ExpiredTokenThenUpdatedToken_UsesNewTokenAndSucceeds()
+    {
+        var observedTokens = new List<string?>();
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var token = req.Headers.Authorization?.Parameter;
+            observedTokens.Add(token);
+
+            return token == "fresh-token"
+                ? new HttpResponseMessage(HttpStatusCode.OK)
+                : new HttpResponseMessage(HttpStatusCode.Unauthorized)
+                {
+                    Content = new StringContent("{\"error\":\"invalid token\"}", Encoding.UTF8, "application/json")
+                };
+        });
+
+        var svc = MakeService(handler);
+
+        using (var expired = new TokenScope("expired-token"))
+        {
+            var firstAttempt = await svc.PingAsync();
+            Assert.False(firstAttempt);
+        }
+
+        using (var fresh = new TokenScope("fresh-token"))
+        {
+            var secondAttempt = await svc.PingAsync();
+            Assert.True(secondAttempt);
+        }
+
+        Assert.Equal(2, observedTokens.Count);
+        Assert.Equal("expired-token", observedTokens[0]);
+        Assert.Equal("fresh-token", observedTokens[1]);
+    }
+
+    [Fact]
     public async Task PingAsync_ReturnsFalse_WhenApiReturns403()
     {
         using var _ = new TokenScope("forbidden-token");

@@ -79,9 +79,11 @@ public class MatcherEngine : IMatcherEngine
                     continue;
                 }
 
+                var highlightTarget = ResolveHighlightTarget(textElem, snapshot.ImageElements);
+
                 results.Add(new MatchResult
                 {
-                    Element = textElem,
+                    Element = highlightTarget,
                     Confidence = confidence,
                     Type = MatchType.TextMatch,
                     MatchedPhrase = phrase
@@ -93,6 +95,15 @@ public class MatcherEngine : IMatcherEngine
         for (int i = 0; i < snapshot.ImageElements.Count; i++)
         {
             var imgElem = snapshot.ImageElements[i];
+
+            if (imgElem.IsDecorative || string.Equals(imgElem.VisualType, "logo", StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Debug("Skipping decorative visual {ElementId} ({ShapeName}) type={Type}",
+                    imgElem.ElementId,
+                    imgElem.ShapeName,
+                    imgElem.VisualType ?? "unknown");
+                continue;
+            }
 
             var (score, phrase, matchedWords, isSemanticMatch) = ImageReferenceMatcher.Score(
                 transcriptText, transcriptEmbedding, imgElem, i, snapshot.ImageElements, _semanticService);
@@ -228,9 +239,12 @@ public class MatcherEngine : IMatcherEngine
                 {
                     results.Remove(bestText);
                     results.Insert(0, bestText);
+                    var imageConfidenceAfterReorder = results.Count > 1 ? results[1].Confidence : results[0].Confidence;
                     Log.Debug(
                         "Text preference override: Image={ImageConf:F2}, Text={TextConf:F2} (margin={Margin:F2})",
-                        results[1].Confidence, bestText.Confidence, requiredMargin);
+                        imageConfidenceAfterReorder,
+                        bestText.Confidence,
+                        requiredMargin);
                 }
                 else
                 {
@@ -258,14 +272,16 @@ public class MatcherEngine : IMatcherEngine
     {
         var results = Match(transcriptText, snapshot);
 
-        if (_ragAgent != null)
+        var ragAgent = _ragAgent;
+        if (ragAgent != null)
         {
-            Log.Debug("RAG check: _ragAgent={RagNotNull}, IsReady={IsReady}", _ragAgent != null, _ragAgent.IsReady);
+            var activeRag = ragAgent;
+            Log.Debug("RAG check: _ragAgent={RagNotNull}, IsReady={IsReady}", true, activeRag.IsReady);
 
-            if (_ragAgent.IsReady)
+            if (activeRag.IsReady)
             {
                 Log.Debug("RAG: Starting context retrieval for text: {Text}", transcriptText);
-                var ragContext = await _ragAgent.RetrieveContextAsync(transcriptText, topK: 5);
+                var ragContext = await activeRag.RetrieveContextAsync(transcriptText, topK: 5);
 
                 if (ragContext.HasContext)
                 {
@@ -273,7 +289,7 @@ public class MatcherEngine : IMatcherEngine
                         ragContext.RetrievedTexts.Count, ragContext.RetrievedImages.Count, ragContext.ContextConfidenceBoost);
 
                     for (int i = 0; i < results.Count; i++)
-                        results[i] = _ragAgent.AugmentMatchConfidence(results[i], ragContext);
+                        results[i] = activeRag.AugmentMatchConfidence(results[i], ragContext);
 
                     // Re-sort with same tie-breaker logic after RAG augmentation
                     results.Sort((a, b) =>
@@ -314,6 +330,31 @@ public class MatcherEngine : IMatcherEngine
     /// is below the single-word threshold. Specific/long words (6+ chars like
     /// "MMLU", "NVIDIA", "benchmark") are exempt because they carry strong signal.
     /// </summary>
+    private static SlideElement ResolveHighlightTarget(TextElement textElem, IReadOnlyList<ImageElement> images)
+    {
+        if (!string.IsNullOrWhiteSpace(textElem.ParentVisualId))
+        {
+            var matchById = images.FirstOrDefault(img =>
+                string.Equals(img.ElementId, textElem.ParentVisualId, StringComparison.OrdinalIgnoreCase));
+            if (matchById != null)
+                return matchById;
+        }
+
+        if (!string.IsNullOrWhiteSpace(textElem.ShapeName))
+        {
+            var prefix = textElem.ShapeName.Split(':', 2)[0].Trim();
+            if (!string.IsNullOrWhiteSpace(prefix))
+            {
+                var matchByName = images.FirstOrDefault(img =>
+                    string.Equals(img.ShapeName, prefix, StringComparison.OrdinalIgnoreCase));
+                if (matchByName != null)
+                    return matchByName;
+            }
+        }
+
+        return textElem;
+    }
+
     private static bool IsSingleWordNoise(string phrase, double confidence)
     {
         if (string.IsNullOrWhiteSpace(phrase))

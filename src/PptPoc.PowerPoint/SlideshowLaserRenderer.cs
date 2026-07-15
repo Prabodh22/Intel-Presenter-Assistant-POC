@@ -80,6 +80,14 @@ public class SlideshowLaserRenderer : IHighlightRenderer
             var app   = slide.Application;
             bool inSlideshow = app.SlideShowWindows.Count > 0;
 
+            if (inSlideshow && IsNativePowerPointPointerActive(app))
+            {
+                _active.Clear();
+                _overlay?.ClearHighlight();
+                Log.Debug("Skipped app overlay highlight because native PowerPoint pointer is active");
+                return;
+            }
+
             if (_active.ContainsKey(request.Element.ElementId))
                 return;
 
@@ -186,6 +194,24 @@ public class SlideshowLaserRenderer : IHighlightRenderer
         catch (Exception ex)
         {
             Log.Warning(ex, "Laser highlight failed for {Id}", request.Element.ElementId);
+        }
+    }
+
+    private static bool IsNativePowerPointPointerActive(Ppt.Application app)
+    {
+        try
+        {
+            if (app.SlideShowWindows.Count <= 0)
+                return false;
+
+            var pointerType = app.SlideShowWindows[1].View.PointerType;
+
+            return pointerType != Ppt.PpSlideShowPointerType.ppSlideShowPointerNone
+                   && pointerType != Ppt.PpSlideShowPointerType.ppSlideShowPointerArrow;
+        }
+        catch
+        {
+            return false;
         }
     }
 

@@ -88,13 +88,17 @@ public static class ImageReferenceMatcher
 
         // ── 1b. Exact/Fuzzy matching against specific OCR words ──────────────────
         // Collect EVERY word with score > 0.7 so they can all be highlighted.
-        if (image.ExtractedWords != null && image.ExtractedWords.Count > 0)
+        var ocrWords = image.SearchableWords != null && image.SearchableWords.Count > 0
+            ? image.SearchableWords
+            : image.ExtractedWords;
+
+        if (ocrWords != null && ocrWords.Count > 0)
         {
             int ocrHitCount = 0;
             double bestOcrScore = 0;
             string bestOcrPhrase = string.Empty;
 
-            foreach (var word in image.ExtractedWords)
+            foreach (var word in ocrWords)
             {
                 // Guard: OCR pipeline may produce null entries or null Text
                 if (word == null || word.Text == null) continue;

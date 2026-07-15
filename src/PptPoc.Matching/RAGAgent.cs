@@ -22,11 +22,25 @@ public class RAGAgent : IRAGAgent
     private RAGContext? _cachedContext;
     private string? _cachedTranscript;
 
-    public bool IsReady =>
-        _kbLoader != null &&
-        _kbLoader.IsLoaded == true &&
-        _semanticService != null &&
-        _semanticService.IsReady;
+    public bool IsReady
+    {
+        get
+        {
+            var semanticService = _semanticService;
+            var kbLoader = _kbLoader;
+            if (semanticService == null || kbLoader == null)
+                return false;
+
+            try
+            {
+                return kbLoader!.IsLoaded == true && semanticService!.IsReady;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     public RAGAgent(AppConfig config)
     {
@@ -59,33 +73,37 @@ public class RAGAgent : IRAGAgent
         }
     }
 
-    public async Task<RAGContext> RetrieveContextAsync(string transcriptText, int topK = 5)
+    public Task<RAGContext> RetrieveContextAsync(string transcriptText, int topK = 5)
     {
         if (!IsReady)
         {
             Log.Warning("RAG Agent not ready. Returning empty context.");
-            return new RAGContext();
+            return Task.FromResult(new RAGContext());
         }
 
         // Return cached result if same transcript
         if (_cachedContext != null && _cachedTranscript == transcriptText)
         {
-            return _cachedContext;
+            return Task.FromResult(_cachedContext);
         }
 
         var context = new RAGContext();
+        var semanticService = _semanticService;
 
         if (string.IsNullOrWhiteSpace(transcriptText))
-            return context;
+            return Task.FromResult(context);
+
+        if (semanticService == null)
+            return Task.FromResult(context);
 
         try
         {
             // Generate embedding for transcript
-            float[]? transcriptEmbedding = _semanticService!.GenerateEmbedding(transcriptText);
+            float[]? transcriptEmbedding = semanticService.GenerateEmbedding(transcriptText);
             if (transcriptEmbedding == null)
             {
                 Log.Warning("Failed to generate embedding for transcript text");
-                return context;
+                return Task.FromResult(context);
             }
 
             // Retrieve similar text elements from KB
@@ -116,7 +134,7 @@ public class RAGAgent : IRAGAgent
             Log.Error(ex, "Error during RAG retrieval");
         }
 
-        return context;
+        return Task.FromResult(context);
     }
 
     public List<string> GetContextKeywords(int maxCount = 25)
@@ -168,9 +186,21 @@ public class RAGAgent : IRAGAgent
     private List<TextElementWithScore> RetrieveTextElements(string transcriptText, float[] transcriptEmbedding, int topK)
     {
         var results = new List<TextElementWithScore>();
+        var kbLoader = _kbLoader;
+        var semanticService = _semanticService;
 
-        if (_kbLoader == null || !_kbLoader.IsLoaded)
+        if (kbLoader == null || semanticService == null)
             return results;
+
+        try
+        {
+            if (kbLoader!.IsLoaded != true)
+                return results;
+        }
+        catch
+        {
+            return results;
+        }
 
         try
         {
@@ -180,9 +210,9 @@ public class RAGAgent : IRAGAgent
             double similarityThreshold = queryTokens.Count >= 3 ? 0.25 : 0.30;
 
             // KB slide indices are 1-based in this project.
-            for (int slideIdx = 1; slideIdx <= _kbLoader.SlideCount; slideIdx++)
+            for (int slideIdx = 1; slideIdx <= kbLoader.SlideCount; slideIdx++)
             {
-                var snapshot = _kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
+                var snapshot = kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
                 if (snapshot == null)
                     continue;
 
@@ -223,7 +253,7 @@ public class RAGAgent : IRAGAgent
                     }
                     else
                     {
-                        var generated = _semanticService!.GenerateEmbedding(textContent);
+                        var generated = semanticService!.GenerateEmbedding(textContent);
                         if (generated == null || generated.Length == 0) continue;
                         elEmbedding = generated;
                     }
@@ -264,9 +294,21 @@ public class RAGAgent : IRAGAgent
     private List<ImageElementWithScore> RetrieveImageElements(string transcriptText, float[] transcriptEmbedding, int topK)
     {
         var results = new List<ImageElementWithScore>();
+        var kbLoader = _kbLoader;
+        var semanticService = _semanticService;
 
-        if (_kbLoader == null || !_kbLoader.IsLoaded)
+        if (kbLoader == null || semanticService == null)
             return results;
+
+        try
+        {
+            if (kbLoader!.IsLoaded != true)
+                return results;
+        }
+        catch
+        {
+            return results;
+        }
 
         try
         {
@@ -276,9 +318,9 @@ public class RAGAgent : IRAGAgent
             double similarityThreshold = queryTokens.Count >= 3 ? 0.20 : 0.25;
 
             // KB slide indices are 1-based in this project.
-            for (int slideIdx = 1; slideIdx <= _kbLoader.SlideCount; slideIdx++)
+            for (int slideIdx = 1; slideIdx <= kbLoader.SlideCount; slideIdx++)
             {
-                var snapshot = _kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
+                var snapshot = kbLoader.GetSnapshot(slideIdx) as SlideSnapshot;
                 if (snapshot == null)
                     continue;
 
@@ -307,7 +349,7 @@ public class RAGAgent : IRAGAgent
                     }
                     else
                     {
-                        var generated = _semanticService!.GenerateEmbedding(description);
+                        var generated = semanticService!.GenerateEmbedding(description);
                         if (generated == null || generated.Length == 0) continue;
                         descEmbedding = generated;
                     }
