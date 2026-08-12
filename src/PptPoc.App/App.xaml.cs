@@ -117,7 +117,7 @@ public partial class App : Application
         if (string.IsNullOrWhiteSpace(path))
             path = "pptpoc-.log";
 
-        return Environment.ExpandEnvironmentVariables(path);
+        return Environment.ExpandEnvironmentVariables(path).Replace("%LocalAppData%", Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
     }
 
     private static void TryLogFatal(Exception ex, string message)
@@ -592,3 +592,6 @@ public partial class App : Application
         base.OnExit(e);
     }
 }
+
+
+

@@ -216,6 +216,7 @@ public class OrchestratorIntegrationTests
         public bool UpsertNotesSection(object slideComObject, string sectionTitle, string content) => true;
         public void NextSlide() { }
         public void PreviousSlide() { }
+        public void GoToSlide(int slideIndex) { }
 
         // Returns null — fake has no real file path
         public string? GetActivePresentationPath() => null;
@@ -391,9 +392,10 @@ public class OrchestratorIntegrationTests
         public int ClearExpiredCalls { get; private set; }
         public int ClearAllCalls { get; private set; }
 
-        public void Highlight(HighlightRequest request, object slideComObject)
+        public bool Highlight(HighlightRequest request, object slideComObject)
         {
             HighlightCalls++;
+            return true;
         }
 
         public void ClearExpired(object? slideComObject)
@@ -409,3 +411,5 @@ public class OrchestratorIntegrationTests
         public void Dispose() { }
     }
 }
+
+

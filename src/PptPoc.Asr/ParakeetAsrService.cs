@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -145,7 +145,7 @@ public sealed class ParakeetAsrService : IAsrService
 
     private static string ResolveStableModelPath(string configuredPath)
     {
-        var path = configuredPath.Trim().Replace('/', Path.DirectorySeparatorChar);
+        var path = configuredPath.Trim().Replace('/', Path.DirectorySeparatorChar).Replace("%LocalAppData%", Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
 
         if (Path.IsPathRooted(path))
         {
@@ -170,19 +170,19 @@ public sealed class ParakeetAsrService : IAsrService
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            // ── Gold Mine #6: Non-blocking inference lock ───────────────────
+            // -- Gold Mine #6: Non-blocking inference lock -------------------
             // If a previous inference is still running, return immediately instead
             // of blocking the processing loop for 60-120ms. The next loop iteration
-            // will try again with a slightly larger audio window — no speech is lost.
+            // will try again with a slightly larger audio window � no speech is lost.
             if (!Monitor.TryEnter(_inferLock))
             {
-                Log.Debug("ASR: Skipping — previous inference still running");
+                Log.Debug("ASR: Skipping � previous inference still running");
                 return new List<TranscriptChunk>();
             }
 
             try
             {
-                // Each call receives an overlapping audio window — reset RNNT state.
+                // Each call receives an overlapping audio window � reset RNNT state.
                 ResetState();
 
                 var mel = RunPreprocessor(audioSamples);
@@ -822,3 +822,6 @@ public sealed class ParakeetAsrService : IAsrService
         DisposeOpenVinoHandles();
     }
 }
+
+
+

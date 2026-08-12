@@ -60,7 +60,7 @@ public class SemanticEmbeddingService : ISemanticEmbeddingService, IDisposable
     private static string ResolveStableModelPath(string configuredPath, string defaultRelativePath)
     {
         var path = string.IsNullOrWhiteSpace(configuredPath) ? defaultRelativePath : configuredPath.Trim();
-        path = path.Replace('/', Path.DirectorySeparatorChar);
+        path = path.Replace('/', Path.DirectorySeparatorChar).Replace("%LocalAppData%", Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
 
         if (Path.IsPathRooted(path))
         {
