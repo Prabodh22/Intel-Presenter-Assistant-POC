@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/PptPoc.App/PptPoc.App.csproj" />
+    <Project Path="src/PptPoc.Asr/PptPoc.Asr.csproj" />
+    <Project Path="src/PptPoc.Audio/PptPoc.Audio.csproj" />
+    <Project Path="src/PptPoc.Core/PptPoc.Core.csproj" />
+    <Project Path="src/PptPoc.Matching/PptPoc.Matching.csproj" />
+    <Project Path="src/PptPoc.Orchestration/PptPoc.Orchestration.csproj" />
+    <Project Path="src/PptPoc.PowerPoint/PptPoc.PowerPoint.csproj" />
+    <Project Path="src/PptPoc.Vision/PptPoc.Vision.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PptPoc.Matching.Tests/PptPoc.Matching.Tests.csproj" />
+    <Project Path="tests/PptPoc.Orchestration.Tests/PptPoc.Orchestration.Tests.csproj" />
+    <Project Path="tests/PptPoc.Vision.Tests/PptPoc.Vision.Tests.csproj" />
+  </Folder>
+</Solution>

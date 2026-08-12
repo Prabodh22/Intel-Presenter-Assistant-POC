@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NoWarn>NU1701</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PptPoc.Core\PptPoc.Core.csproj" />
+    <ProjectReference Include="..\PptPoc.PowerPoint\PptPoc.PowerPoint.csproj" />
+    <ProjectReference Include="..\PptPoc.Matching\PptPoc.Matching.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Serilog" Version="4.2.*" />
+  </ItemGroup>
+
+</Project>

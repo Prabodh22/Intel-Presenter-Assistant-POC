@@ -1,0 +1,292 @@
+# PPT POC Phases
+
+- Phase 1: Unified YAML KB — Completed
+  - Date: 2026-07-23
+  - Description: Replaced legacy ElementKB model with unified `EntityKB` schema; added fields for canonical, spoken/ocr/asr variants, technical terms, numeric normalization, units, relationships, and confidence metadata. Preprocessor and loader updated to emit/consume `EntityKB` while preserving backward-compatible aliases.
+  - Files modified:
+    - src/PptPoc.Core/Models/KnowledgeBase.cs
+    - src/PptPoc.Orchestration/KnowledgeBasePreprocessor.cs
+    - src/PptPoc.Orchestration/KnowledgeBaseLoader.cs
+    - src/PptPoc.Core/Utilities/EntityVariantGenerator.cs
+    - src/PptPoc.PowerPoint/SlideReader.cs
+    - tests/PptPoc.Orchestration.Tests/KnowledgeBaseLoaderTests.cs
+  - Notes:
+    - Deterministic variant generation implemented for numbers, acronyms, and units.
+    - Preprocessor now emits unified entities; loader maps them to runtime `SemanticEntity` objects.
+
+- Phase 1.5: Semantic Entity Extraction — Completed
+  - Date: 2026-07-23
+  - Description: All slide objects (text, images, charts, tables, SmartArt, diagrams, grouped shapes) are converted into unified `SemanticEntity` objects at preprocessing and runtime. Chart/table relationships (series→chart, table→cells) are extracted and preserved in `relationships`.
+  - Files modified:
+    - src/PptPoc.Core/Models/SlideElements.cs
+    - src/PptPoc.PowerPoint/SlideReader.cs
+    - src/PptPoc.Orchestration/KnowledgeBasePreprocessor.cs
+    - src/PptPoc.Orchestration/KnowledgeBaseLoader.cs
+  - Notes:
+    - Deduplication/merge rules applied at KB build time (canonical-based union of variants, numeric normalizations, relationships; confidence=max).
+    - Runtime `SlideSnapshot.SemanticEntities` exposed for downstream matching.
+
+- Phase 2: Unified Domain Vocabulary — Completed
+  - Date: 2026-07-23
+  - Description: Build a dynamic, low-latency domain vocabulary from `SemanticEntity` objects on the active slide, merging duplicated concepts across modalities. Vocabulary items include canonical forms, spoken/ocr/asr variants, technical terms, acronyms, keywords, numeric values, units, and relationship entries. Vocabulary updates on slide change and is usable by ASR vocabulary hints and runtime correction without calling any AI.
+  - Files modified/added (so far):
+    - src/PptPoc.Orchestration/Orchestrator.cs (vocabulary builder)
+    - (phase 2 runtime uses existing `SemanticEntity` and `EntityVariantGenerator`)
+  - Notes:
+    - Vocabulary builder now prefers `SemanticEntities` and synthesizes deterministic variants for live slides.
+    - Vocabulary passed to ASR via `SetVocabularyHints` on slide change.
+
+- Phase 3: Domain Correction Layer — Completed
+  - Date: 2026-07-23
+  - Description: Implemented a deterministic, slide-local domain correction layer (`DomainCorrectionLayer`) applied immediately after ASR. Uses only active slide `SemanticEntities` and vocabulary; performs exact, fuzzy (Levenshtein) and numeric normalization corrections; returns per-word confidences and overall confidence. Integrated into `Orchestrator` in the ASR chunk handling and pre-match correction points.
+  - Files modified/added:
+    - src/PptPoc.Core/Utilities/DomainCorrectionLayer.cs
+    - src/PptPoc.Orchestration/Orchestrator.cs
+  - Notes:
+    - Corrections are deterministic and AI-free; they only modify tokens present in the active slide KB.
+    - Returns `CorrectionResult` with `WordCorrection` entries for downstream logging or telemetry.
+
+- Phase 4: Phonetic Correction — Removed
+  - Date: 2026-07-23
+  - Description: The phonetic fallback stage (Double Metaphone/Soundex) was intentionally removed to keep the correction pipeline conservative and slide-local. Corrections now rely only on exact and fuzzy (Levenshtein) matching plus numeric normalization; no phonetic projection is applied at runtime.
+  - Files modified:
+    - src/PptPoc.Core/Utilities/DomainCorrectionLayer.cs (removed phonetic index and DoubleMetaphoneFull)
+    - src/PptPoc.Matching/TranscriptVocabularyCorrector.cs (removed phonetic projection)
+  - Notes:
+    - Removing phonetic fallback simplifies architecture and reduces false-positive risk in domain-specific technical vocabularies.
+  - Next steps:
+    - Add unit tests documenting current Levenshtein-only behavior and guard rails for future phonetic re-introduction.
+    - Optionally vendor a vetted Double Metaphone implementation and gate it behind a feature flag.
+
+**Current Recommendations & Limitations**
+- OCR/COM text quality is the primary limiter: missing or garbled OCR cannot be recovered deterministically.
+- Vision LLM enrichments (`gpt_description`) remain optional and async; runtime vocabulary must not depend on them.
+- Deduplication uses canonical-string equality currently; consider embedding-based fuzzy merge for cross-modal near-duplicates.
+- Relationship values are stored as compact pipe-separated strings for now; consider serializing typed lists/objects for clarity in future phases.
+- Numeric/version parsing handles common formats; exotic version schemes may need custom heuristics.
+- Performance: current vocabulary builder is deterministic and in-memory; if profiling shows latency, add a precomputed in-memory index (trie or hash) and limit vocabulary size.
+
+- Next review: After all planned phases are implemented, run a final pass to list remaining limitations and propose prioritized next steps.
+ 
+- Phase 6: Temporal Smoothing — Completed
+  - Date: 2026-07-23
+  - Description: Added lightweight temporal smoothing in the `Orchestrator` processing loop to reduce highlight flicker from transient ASR errors. Uses a rolling top-candidate window with a quick-switch escape hatch for rapid presenter transitions.
+  - Files modified:
+    - src/PptPoc.Orchestration/Orchestrator.cs
+  - Notes:
+    - Configurable parameters added to `AppConfig`: `TemporalSmoothingWindowSize`, `TemporalSmoothingRequiredVotes`, `TemporalSmoothingQuickSwitchMargin`.
+    - Smoothing is applied before debounce/highlight rendering to avoid extra latency or memory usage.
+
+- Phase 7: Number & Decimal Normalization — Implemented (in progress)
+  - Date: 2026-07-23
+  - Description: Normalize numeric expressions across modalities so that `17.4`, `17 point four`, `seventeen point four`, and `17 dot four` resolve to a single canonical representation. Supports decimals, percentages, memory sizes (KB/MB/GB/TB), frequencies (Hz/kHz/MHz), power (W/kW), and simple version tokens. Integrated into the domain correction stage so ASR outputs are normalized prior to vocabulary matching.
+  - Files modified/added:
+    - src/PptPoc.Core/Utilities/DomainCorrectionLayer.cs (number parsing & normalization helpers; pre-normalization pass)
+  - Notes:
+    - Normalization rules:
+      - Spoken numbers parsed into numeric form (supports integer words, `point`/`dot` decimals, and digit sequences).
+      - Units mapped to normalized abbreviations (`%`, `KB`, `MB`, `GB`, `TB`, `Hz`, `kHz`, `MHz`, `W`, `kW`).
+      - Version tokens normalized to `v1.2.3` style when `version` prefix or leading `v` detected.
+    - Integrated into `DomainCorrectionLayer.CorrectTranscript` as a pre-processing pass that replaces multi-token spoken numbers with a single canonical token.
+    - Conservative heuristics used to avoid false positives; additional unit tests recommended to cover edge cases (e.g., ordinals, ranges, and locale-specific separators).
+
+- Phase 8: Unified Confidence Fusion — Implemented
+  - Date: 2026-07-23
+  - Description: Replaced ad-hoc confidence decision logic with a unified weighted fusion that combines multiple signals into a single, explainable confidence score per `SemanticEntity` candidate. The fusion produces a per-component breakdown for telemetry and debugging and is applied consistently across text, image, chart, table and diagram entities.
+  - Files modified/added:
+    - src/PptPoc.Matching/UnifiedConfidenceFusion.cs (new)
+    - src/PptPoc.Matching/MatcherEngine.cs (uses fusion output)
+    - src/PptPoc.Core/Models/MatchResult.cs (adds `ConfidenceBreakdown` + `Score`)
+  - Fusion components and default weights:
+    - Semantic similarity: 0.40 — cosine similarity between transcript and entity embedding.
+    - Fuzzy similarity: 0.20 — normalized Levenshtein-based phrase match.
+    - Domain correction confidence: 0.15 — how well the domain correction layer trusts the corrected transcript.
+    - Entity confidence: 0.10 — per-entity confidence metadata when present.
+    - Relationship confidence: 0.05 — small boost when entity relationships exist.
+    - Object-type confidence: 0.10 — favors richer modalities (images/charts with descriptions) when appropriate.
+  - Multiplicative penalties:
+    - ASR confidence multiplies the weighted sum (default 1.0 when unavailable).
+    - Phonetic confidence (disabled by default) can reduce penalty impact if enabled.
+  - Behaviour notes:
+    - The fusion returns a final fused score in `[0,1]` and a `ConfidenceBreakdown` dictionary with per-component values and the raw weighted sum.
+    - `MatcherEngine` now uses the fused score as the primary ranking `Score`, and `ConfidenceScorer` still applies layout/type penalties (titles, single-word guards, image penalty) to produce the final reportable `Confidence` used for thresholding.
+    - Only the top-ranked semantic entity is highlighted (Orchestrator unchanged — it still takes the top match), and the `MatchResult` contains the breakdown for logging/UI.
+  - Next steps:
+    - Add telemetry/logging to persist `ConfidenceBreakdown` for post-run analysis.
+    - Tune weights using an evaluation harness (A/B run on recorded presenter sessions) rather than ad-hoc adjustments.
+
+- Phase 9: Logging & Evaluation — Implemented
+  - Date: 2026-07-23
+  - Description: Added an opt-in, lightweight NDJSON evaluation logger to record detailed per-transcription-window diagnostics for debugging and offline analysis. Logging is non-blocking and disabled by default to avoid runtime overhead in release builds.
+  - Files modified/added:
+    - src/PptPoc.Core/Utilities/EvaluationLogger.cs (new)
+    - src/PptPoc.Core/Configuration/AppConfig.cs (added `EvaluationLoggingEnabled`, `EvaluationLogPath`)
+    - src/PptPoc.Orchestration/Orchestrator.cs (emit evaluation record per window)
+    - src/PptPoc.Core/Models/MatchResult.cs (expose `Score` and `ConfidenceBreakdown` — used for logging)
+  - What is logged (one NDJSON object per transcription window):
+    - `timestampUtc`, `rawTranscript`, `cleanedTranscript`, `correctedTranscript`, `domainCorrections`
+    - `candidates`: elementId, shapeName, type, matchedPhrase, score, confidence, breakdown
+    - `selected`: chosen highlight element and confidence
+  - Runtime knobs:
+    - `EvaluationLoggingEnabled` (default: false)
+    - `EvaluationLogPath` (default: `logs/eval.ndjson`)
+  - Notes:
+    - Logger is thread-safe and non-fatal; minimal overhead when disabled.
+    - Records are appended as NDJSON; rotate or trim logs externally for long runs.
+  - Next steps:
+    - Add a small analysis script to aggregate metrics and help tune fusion weights.
+    - Optionally wire telemetry to a secure telemetry sink for centralized analysis.
+
+**Review: Are requested changes/optimizations present?**
+
+- Domain correction layer (exact + Levenshtein + numeric normalization): ✔ implemented (`src/PptPoc.Core/Utilities/DomainCorrectionLayer.cs`).
+- Numeric/version normalization (Phase 7): ✔ implemented (pre-normalization pass inside DomainCorrectionLayer).
+- Temporal smoothing (Phase 6): ✔ implemented (`src/PptPoc.Orchestration/Orchestrator.cs`, config knobs in `AppConfig`).
+- Canonical-entity merging and canonical embeddings (Phase 5): ✔ implemented (MatcherEngine updates produce canonical embeddings when missing).
+- Unified confidence fusion (Phase 8): ✔ implemented (`src/PptPoc.Matching/UnifiedConfidenceFusion.cs`, integrated in `MatcherEngine`).
+- MatchResult enrichment for explainability: ✔ implemented (`Score` and `ConfidenceBreakdown` added).
+- Evaluation logging (Phase 9): ✔ implemented (`EvaluationLogger` + Orchestrator wiring + config knobs).
+- Build & sanity: ✔ solution builds successfully after changes (local `dotnet build` completed with warnings).
+
+If you'd like, I can:
+- Add the analysis script to summarize `logs/eval.ndjson` (recommended next step).
+- Add unit tests that assert correctness of domain corrections, numeric normalization, and a deterministic fusion example.
+
+- Phase 10: Runtime Artifact Consolidation, Latency & Highlight Accuracy Hardening — Implemented
+  - Date: 2026-07-27
+  - Trigger: Live run showed delayed/inaccurate highlights, image highlighting used mixed laser-dot/bounding-box visuals, and runtime artifacts were split across `%LocalAppData%`, app `bin` output, and workspace `logs`.
+  - Files modified/added:
+    - src/PptPoc.Core/Utilities/RuntimeArtifactPaths.cs (new shared artifact path resolver)
+    - src/PptPoc.App/App.xaml.cs (runtime logs and eval NDJSON now resolve through shared artifact path)
+    - src/PptPoc.Orchestration/KbPathHelper.cs (YAML KB files now default to the shared logs/artifact directory)
+    - src/PptPoc.PowerPoint/SlideReader.cs (image enrichment NDJSON now writes to the same artifact directory; OCR status/fallback diagnostics added)
+    - src/PptPoc.Core/Interfaces/IHighlightRenderer.cs (renderer now reports whether a highlight was actually drawn)
+    - src/PptPoc.PowerPoint/SlideshowLaserRenderer.cs (whole-element fallback changed from laser dot to uniform spotlight rectangle)
+    - src/PptPoc.PowerPoint/Views/LaserOverlayWindow.xaml.cs (added whole-element spotlight rectangle animation)
+    - src/PptPoc.PowerPoint/EditModeRenderer.cs (returns render success/failure)
+    - src/PptPoc.Orchestration/Orchestrator.cs (shorter slide-change grace, shorter stale transcript context, renderer skip no longer recorded as applied)
+    - src/PptPoc.Core/Configuration/AppConfig.cs, src/PptPoc.App/appsettings.json, src/PptPoc.App/appsettings.example.json (live latency defaults and evaluation logging enabled)
+  - Runtime artifact behavior:
+    - Relative artifact paths now resolve to the workspace `logs/` folder when running from this repo, including debug exe runs from `bin/Debug/.../win-x64`.
+    - For packaged exe deployments outside the workspace, artifacts fall back to an app-local `logs/` folder when writable, then `%LocalAppData%/PptPoc/logs` if needed.
+    - `PPTPOC_ARTIFACTS_DIR` can override the artifact directory for installer/MSI deployments.
+    - Session logs, `eval.ndjson`, image enrichment NDJSON, and `knowledge_base_*.yaml` now share the same artifact location.
+  - Latency/accuracy changes:
+    - `TranscriptWindowSeconds` reduced from 10 to 4 for live highlighting to reduce stale context.
+    - Highlight duration reduced to 1200ms and cooldown to 450ms for faster presenter transitions.
+    - Slide-change grace reduced from 1500ms to 500ms while keeping first-ASR-result quarantine.
+    - Temporal smoothing defaults changed to a low-latency 3-cycle window with 1 required vote; quick-switch behavior remains available.
+    - Evaluation logging is enabled by default so `logs/eval.ndjson` records raw/cleaned/corrected transcripts, candidates, confidence breakdowns, and selected highlights.
+  - Image/OCR hardening:
+    - Whole-image semantic matches now use the same rectangle/spotlight visual language as OCR word highlights instead of a center laser dot.
+    - OCR word matches still draw tight word-cluster rectangles when OCR boxes are available.
+    - Image enrichment records now include `ocr_status`, `searchable_word_count`, `visual_type`, and fallback search text preview.
+    - Zero-OCR images now explicitly report whether they degraded to semantic, metadata, or no-text fallback.
+  - Notes and remaining limitation:
+    - Blank/white/overlapping screenshots with no OCR words cannot be made region-accurate deterministically; the app can only highlight the whole visual unless OCR, table/cell extraction, or manual region metadata is available.
+    - For 90-95% production accuracy, native PPT text and images with good OCR are realistic targets; screenshot/table images with `ocr_word_count=0` remain the main accuracy ceiling.
+  - Validation:
+    - Focused builds passed for Core, PowerPoint, and Orchestration projects.
+    - App project compiled successfully to a temporary output directory to avoid the currently running tray app locking the normal `bin` DLLs.
+    - Full solution build to normal output was blocked by the running `PptPoc.App` process locking DLLs, not by compile errors.
+
+- Phase 11: Laser-Only Highlighting, Overlay Focus, and Table False-Positive Guardrails — Implemented
+  - Date: 2026-07-27
+  - Trigger: Fresh `logs/eval.ndjson` and `logs/pptpoc-20260727.log` review showed slide 3/6 low-confidence table/content-placeholder selections during presenter observations, mixed laser/blue/yellow bounding-box visuals, and keyboard arrow navigation being blocked while the overlay was active.
+  - Files modified:
+    - src/PptPoc.PowerPoint/SlideshowLaserRenderer.cs (slideshow highlights now always use the laser dot; OCR word matches still target the merged OCR word box center but no longer draw rectangles)
+    - src/PptPoc.PowerPoint/Views/LaserOverlayWindow.xaml and `.xaml.cs` (overlay is now non-activating and transparent to input/focus, preserving PowerPoint keyboard navigation)
+    - src/PptPoc.PowerPoint/EditModeRenderer.cs (edit-mode fallback changed from rectangle/bounding-box shapes to a small red laser dot)
+    - src/PptPoc.Matching/MatcherEngine.cs (guards added for feedback/observation speech and generic table terms)
+  - Log findings:
+    - Slide 3 extracted `Content Placeholder 4` as a 4x3 table and repeatedly matched it during observation-style speech about highlight delay and bounding behavior.
+    - Slide 6 extracted `Content Placeholder 3` as a 7x9 table and later selected table/image-placeholder matches while the presenter was describing table highlight behavior rather than slide content.
+    - Slide 8 `Action items` records actually selected `Title 1:P1` with phrase `action item`; the table candidate existed only as a lower-confidence `action` match. The visible confusion was amplified by bounding-box styling and large target geometry.
+  - Behavior changes:
+    - Live highlights for text, OCR words, images, and tables now use a uniform laser pointer dot instead of blue/yellow/orange rectangles.
+    - OCR precision is preserved as a targeting decision: when OCR boxes are available, the dot lands at the matched OCR cluster center.
+    - Table-like elements suppress low-confidence feedback observations such as `my observation`, `bounding box`, `blue colour`, `slide number`, and delay commentary.
+    - Generic table words such as `action`, `issue`, `status`, `owner`, `table`, `column`, and `current` no longer select large table placeholders unless there is explicit row/column/table intent and enough confidence.
+  - Validation:
+    - `dotnet build src/PptPoc.PowerPoint/PptPoc.PowerPoint.csproj --no-restore` passed after overlay and renderer changes.
+    - `dotnet build src/PptPoc.Matching/PptPoc.Matching.csproj --no-restore` passed after matcher guardrails.
+    - `dotnet test tests/PptPoc.Matching.Tests/PptPoc.Matching.Tests.csproj --no-restore` still has 4 pre-existing expectation failures unrelated to the new table guardrails: two confidence-threshold assertions, one MMLU text-vs-image expectation, and one stop-word-only assertion.
+
+- Phase 12: Table Intent Resolver and Region-Aware Image Targeting — Implemented
+  - Date: 2026-07-27
+  - Trigger: Presenter UX requirement that tables and images should not produce noisy multi-cell or whole-box highlights. The app should resolve spoken intent to one laser-dot target: specific cell, row key, column header, row/column intersection, OCR word cluster, image center, or image region.
+  - Files modified/added:
+    - src/PptPoc.Matching/TableIntentResolver.cs (new table-aware resolver)
+    - src/PptPoc.Matching/MatcherEngine.cs (resolver wired ahead of generic fuzzy matching; table cells remain cell targets instead of routing back to parent table; semantic image matches can target top/bottom/left/right/center regions)
+    - tests/PptPoc.Matching.Tests/MatcherBehaviorContractTests.cs (focused regression coverage for table and image targeting behavior)
+  - Table behavior now implemented:
+    - Specific cell value mention targets that cell with one laser dot.
+    - Column references target the column header, not every cell in the column.
+    - Row references target the spoken row key/value cell, such as `input prompt 256`.
+    - Combined row + column evidence targets the intersection cell, such as `old configuration + input prompt 256 + RAM consumption` resolving to the `3 GB` cell.
+    - Resolved table intent is authoritative for that table in the current transcript window, so generic fuzzy matches from sibling cells do not outrank the intent target.
+  - Image behavior now implemented:
+    - OCR word matches still target the matched OCR word cluster center.
+    - Semantic image matches without OCR still target the image center.
+    - Spatial image phrases such as `top right`, `bottom left`, `right side`, `center`, or `middle` produce a small proxy target inside that image region, so the laser dot lands in the referenced area rather than always at the image center.
+    - Bounding boxes remain disabled in slideshow and edit-mode rendering; the visual language stays laser-dot only.
+  - Product behavior examples:
+    - Slide 8: `Action column` should target the `Action` header cell, not the full table.
+    - Slide 5: `with old configuration for input prompt 256, the RAM consumption is 3 GB` should target the intersection/result cell (`3 GB`) instead of highlighting the whole table or every matching cell.
+    - Image/diagram: `look at the top right workflow diagram` should target a top-right region proxy inside the matched image.
+  - Validation:
+    - `dotnet test tests/PptPoc.Matching.Tests/PptPoc.Matching.Tests.csproj --no-restore --filter FullyQualifiedName~MatcherBehaviorContractTests` passed: 6/6 tests.
+    - Matching project compiled as part of the focused test run; existing warnings remain unchanged (`Microsoft.ML.Tokenizers` package resolution and nullable warning in MatcherEngine).
+
+- Phase 13: Presentation Context Memory, Active Visual Hold, and Cache Freshness Hardening — Implemented
+  - Date: 2026-07-29
+  - Trigger: Latest review showed duplicate table headers such as `Generation speed` across multiple slide 5 tables, presenter anxiety during silent matching/debounce delays, laser dots disappearing too quickly, meta-observation speech causing random low-confidence highlights, and uncertainty about YAML cache location/freshness.
+  - Files modified:
+    - NuGet.Config (clears broken machine fallback package folders so repo-local restores/builds do not depend on `C:\Program Files (x86)\Microsoft Visual Studio\Shared\NuGetPackages`)
+    - src/PptPoc.Core/Configuration/AppConfig.cs (per-type duration and context-hold knobs)
+    - src/PptPoc.App/appsettings.json and appsettings.example.json (production highlight defaults)
+    - src/PptPoc.Orchestration/KnowledgeBasePreprocessor.cs (prefers real `GetActivePresentationPath()` for canonical YAML path and stale-cache comparison)
+    - src/PptPoc.Orchestration/Orchestrator.cs (optimistic hold, active visual mode, ambiguity suppression, status updates, per-type duration selection)
+    - src/PptPoc.Matching/TableIntentResolver.cs (table scope resolver for ordinal/spatial/content anchors and active-table scoping)
+    - src/PptPoc.Matching/MatcherEngine.cs (active table memory, outside-scope table suppression, actionability gating)
+    - src/PptPoc.PowerPoint/SlideshowLaserRenderer.cs and Views/LaserOverlayWindow.xaml.cs (same-target laser refresh and per-request slideshow duration)
+    - src/PptPoc.PowerPoint/EditModeRenderer.cs (per-request edit-mode duration tagging)
+    - tests/PptPoc.Matching.Tests/MatcherBehaviorContractTests.cs (duplicate table-header regression)
+  - Behavior changes:
+    - YAML KB files still resolve through `KbPathHelper` into the shared runtime artifact directory, which defaults to workspace `logs/` during repo runs.
+    - On startup/preprocess, stale YAML is rebuilt when the real PPT file timestamp is newer than the cached YAML timestamp. Manual Refresh KB remains the fallback for title-only/SharePoint cases where file timestamps are unavailable.
+    - Table scope is now remembered for roughly 20 seconds after explicit cues such as `first table`, `second table`, `left/right/top/bottom table`, or strong table-content anchors.
+    - Bare duplicate references such as `generation speed` resolve inside the active table instead of jumping back to the first matching table.
+    - Generic table-cell and table-visual fallback matches outside the active table scope are suppressed.
+    - Meta-observation speech and low-actionability phrases such as highlight/delay/bounding-box commentary are suppressed more aggressively before they can produce random bullets/tables.
+    - Runtime now reports lightweight states such as waiting for confidence, candidate found, holding active visual, and holding last confident highlight.
+    - Text/bullet/cell highlights default to about 2 seconds, table targets about 2.5 seconds, and image/diagram targets about 6 seconds.
+    - Active Visual Mode keeps image/diagram context alive for about 8 seconds and resists switching away unless a non-image candidate wins by a strong margin.
+    - Same-target laser updates refresh the existing pulse instead of being blocked forever by renderer active-state tracking.
+  - Validation:
+    - `dotnet restore tests/PptPoc.Matching.Tests/PptPoc.Matching.Tests.csproj` passed after clearing fallback package folders; existing `Microsoft.ML.Tokenizers` approximate-version warning remains.
+    - `dotnet test tests/PptPoc.Matching.Tests/PptPoc.Matching.Tests.csproj --no-restore --filter FullyQualifiedName~MatcherBehaviorContractTests` passed: 7/7 tests.
+    - `dotnet build src/PptPoc.Matching/PptPoc.Matching.csproj --no-restore` passed.
+    - `dotnet build src/PptPoc.PowerPoint/PptPoc.PowerPoint.csproj --no-restore` passed.
+    - `dotnet build src/PptPoc.Orchestration/PptPoc.Orchestration.csproj --no-restore` passed with existing package warning and one nullable warning around the current snapshot call.
+
+## Phase 8: Spatial, Numeric, and UI Refinements (2026-08-03)
+- **Goal:** Correct compound spatial resolution in Image Matcher, correct tabular multi-digit number resolution, and resolve application blocking issues.
+- **Key Files Modified:**
+  - src/PptPoc.Matching/ImageReferenceMatcher.cs
+  - src/PptPoc.Matching/TableIntentResolver.cs
+  - src/PptPoc.App/App.xaml.cs
+- **Behavior Changes:**
+  - Resolved compound X/Y directional targeting inside ImageReferenceMatcher by restructuring the spatial logic out of loop. Directions such as "top left" now correctly map both variables instead of short-circuiting on the first dimension matched.
+  - Relaxed fallback fuzzy scoring logic for smaller numbers and integers within TableIntentResolver so specific data cells like 18.95 lock-in cleanly and override general header definitions.
+  - Eliminated the rendering freeze (seen as a "black box" display hanging) that occurred when the PromptForToken modal initialized as a child of a non-existent main window process from the system tray.
+
+## Phase 9: Headless Tray UI & File Locking Fixes (2026-08-05)
+- **Goal:** Transform app into a headless background utility using Win32 System Tray, present real-time Parakeet download progress, and fix YAML generation data corruption.
+- **Key Files Modified:**
+  - \src/PptPoc.App/App.xaml.cs\`n  - \src/PptPoc.App/StatusIndicatorWindow.xaml.cs\`n  - \src/PptPoc.Orchestration/Orchestrator.cs\`n  - \src/PptPoc.Orchestration/KnowledgeBasePreprocessor.cs\`n- **Behavior Changes:**
+  - Removed all blocking \MessageBox\ windows on app load and migrated critical loading status cues to non-blocking Toast/Balloon ToolTips via \System.Windows.Forms.NotifyIcon\.
+  - Migrated the application entrypoint to fully headless execution on a background \Task.Run\, keeping the WPF \Dispatcher\ isolated to the \EditModeRenderer\ presentation loop to prevent UI crashes.
+  - Captured the \DownloadProgressChanged\ event from \ParakeetAsrService\ and bridged it through the \Orchestrator\ to explicitly render active model-download percentages inside the System Tray Hover Tooltip (\NotifyIcon.Text\). Added string truncation to < 64 chars to prevent Win32 fatal crashes.
+  - Improved KnowledgeBasePreprocessor artifact generation mapping. Writes \.kb.yaml\ file natively to a \.tmp\ location first and atomic-moves via \File.Move()\ to prevent partial file writes when PPT gracefully aborts or crashes mid-COM evaluation.
+
