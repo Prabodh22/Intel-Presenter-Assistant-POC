@@ -362,6 +362,7 @@ public partial class App : Application
 
                 // -- Step 5: Rebuild KB -----------------------------------------
                 _notifyIcon.Text = "PPT Highlighting Engine (Rebuilding KB...)";
+                _notifyIcon.ShowBalloonTip(3000, "PPT Helper", "Analyzing slides...", ToolTipIcon.Info);
                 _statusIndicator?.UpdateStatus("Rebuilding KB...");
                 Log.Information("Refresh KB: rebuilding knowledge base from scratch...");
 
