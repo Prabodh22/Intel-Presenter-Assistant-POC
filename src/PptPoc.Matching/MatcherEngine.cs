@@ -24,7 +24,8 @@ public class MatcherEngine : IMatcherEngine
         "highlight", "highlights", "highlighted", "laser", "pointer", "dot",
         "delay", "delayed", "bounding", "box", "colour", "color", "blue", "yellow",
         "slide", "number", "title", "content", "image", "picture", "table",
-        "thing", "something", "observation", "overall"
+        "thing", "something", "observation", "overall",
+        "on", "the", "a", "an", "is", "are", "it", "this", "that"
     };
 
     private static readonly string[] FeedbackPhrases =
@@ -479,8 +480,10 @@ public class MatcherEngine : IMatcherEngine
             return 0;
         });
 
-        // ── Enhancement #5: Reduced text-over-image override aggression ─────────
-        const int sentenceWordThreshold = 5;
+        // ── Enhancement #5: Exact Phrase OCR vs Text resolution ─────────
+        // If an image OCR match and a text paragraph match both score highly (exact keywords),
+        // we explicitly let the text block win if it contains the literal phrase the user spoke.
+        const int sentenceWordThreshold = 1; // Relaxed so short phrases can invoke text overlap correction
         const double imageOverTextMargin = 0.05;
         int transcriptWordCount = transcriptText
             .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -492,24 +495,40 @@ public class MatcherEngine : IMatcherEngine
         {
             var bestText = results.FirstOrDefault(r => r.Type == MatchType.TextMatch);
 
-            if (bestText != null && bestText.Confidence > results[0].Confidence - imageOverTextMargin)
+            if (bestText != null)
             {
                 bool imageIsSemantic = results[0].ParentImageElement == null
                     && results[0].Element is ImageElement ie
                     && !string.IsNullOrWhiteSpace(ie.GptDescription);
 
-                double requiredMargin = imageIsSemantic ? 0.15 : imageOverTextMargin;
-
-                if (bestText.Confidence > results[0].Confidence - requiredMargin)
+                // If bestText contains the exact phrase, it deserves an immediate override
+                // against an image node, dodging standard padding boundaries.
+                bool exactTextContainsSpoken = false;
+                if (bestText.Element is TextElement te && !string.IsNullOrWhiteSpace(te.NormalizedText))
                 {
+                     string normTrans = TextNormalizer.Normalize(transcriptText);
+                     exactTextContainsSpoken = te.NormalizedText.Contains(normTrans, StringComparison.OrdinalIgnoreCase);
+                }
+                
+                double requiredMargin = imageIsSemantic ? 0.15 : imageOverTextMargin;
+                if (exactTextContainsSpoken)
+                {
+                    requiredMargin = -1.0; // Force exact text match to win against diagram OCR grouping 
+                }
+
+                if (bestText.Confidence > results[0].Confidence - requiredMargin || exactTextContainsSpoken)
+                {
+                    // Dynamically boost confidence so the downstream Debounce system respects it
+                    if (exactTextContainsSpoken) bestText.Confidence = 1.0;
+
                     results.Remove(bestText);
                     results.Insert(0, bestText);
                     var imageConfidenceAfterReorder = results.Count > 1 ? results[1].Confidence : results[0].Confidence;
                     Log.Debug(
-                        "Text preference override: Image={ImageConf:F2}, Text={TextConf:F2} (margin={Margin:F2})",
+                        "Text preference override: Image={ImageConf:F2}, Text={TextConf:F2} (exact_overlap={Exact})",
                         imageConfidenceAfterReorder,
                         bestText.Confidence,
-                        requiredMargin);
+                        exactTextContainsSpoken);
                 }
                 else
                 {

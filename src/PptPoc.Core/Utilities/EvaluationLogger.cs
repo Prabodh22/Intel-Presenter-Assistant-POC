@@ -19,13 +19,20 @@ namespace PptPoc.Core.Utilities
             _config = config;
             try
             {
-                if (_config.EvaluationLoggingEnabled)
+                if (_config.EvaluationLoggingEnabled && !string.IsNullOrWhiteSpace(_config.EvaluationLogPath))
                 {
+                    _config.EvaluationLogPath = ResolveLogPath(_config.EvaluationLogPath);
                     var dir = Path.GetDirectoryName(_config.EvaluationLogPath) ?? "logs";
                     if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
                 }
             }
             catch { /* swallow */ }
+        }
+
+        private static string ResolveLogPath(string path)
+        {
+            return Environment.ExpandEnvironmentVariables(path)
+                .Replace("%LocalAppData%", Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
         }
 
         public static async Task LogAsync(object record)
